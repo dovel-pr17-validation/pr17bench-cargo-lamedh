@@ -1,0 +1,372 @@
+//! Integration tests for lib/23-match.lisp: the structural pattern language
+//! (PAT-MATCH core; MATCH / DESTRUCTURING-BIND / SGREP / REWRITE surfaces),
+//! plus the reader amendment that admits `?`-leading symbols and `_` as a
+//! symbol constituent.
+
+use lamedh::environment::Environment;
+use lamedh::{Shared, eval_line, with_large_stack};
+
+fn env() -> Shared<Environment> {
+    Environment::with_stdlib()
+}
+
+// ------------------------------------------------------------- reader ----
+
+#[test]
+fn reader_admits_pattern_symbols() {
+    let e = env();
+    assert_eq!(eval_line("'?x", &e), "?X");
+    assert_eq!(eval_line("'??xs", &e), "??XS");
+    assert_eq!(eval_line("'?_", &e), "?_");
+    assert_eq!(eval_line("'some_name", &e), "SOME_NAME");
+    // The `?`-suffix predicate naming convention is untouched.
+    assert_eq!(eval_line("'null?", &e), "NULL?");
+}
+
+// ---------------------------------------------------------- pat-match ----
+
+#[test]
+fn pat_match_binds_and_fails() {
+    let e = env();
+    assert_eq!(
+        eval_line("(pat-match '(?x ?y) '(1 2))", &e),
+        "((?Y . 2) (?X . 1))"
+    );
+    // Repeated variable must be EQUAL (unification-lite).
+    assert_eq!(
+        eval_line("(match-fail-p (pat-match '(?x ?x) '(1 2)))", &e),
+        "T"
+    );
+    assert_eq!(
+        eval_line("(match-fail-p (pat-match '(?x ?x) '(1 1)))", &e),
+        "()"
+    );
+    // A match that binds nothing is NIL, not failure.
+    assert_eq!(eval_line("(pat-match '(a b) '(a b))", &e), "()");
+    assert_eq!(
+        eval_line("(match-fail-p (pat-match '(a b) '(a c)))", &e),
+        "T"
+    );
+}
+
+#[test]
+fn pat_match_segments_backtrack() {
+    let e = env();
+    assert_eq!(
+        eval_line("(pat-match '(a ??mid z) '(a b c d z))", &e),
+        "((??MID B C D))"
+    );
+    // Two segments around a literal anchor require backtracking.
+    assert_eq!(
+        eval_line("(pat-match '(??x c ??y) '(a b c d e))", &e),
+        "((??Y D E) (??X A B))"
+    );
+    // Empty segments are allowed.
+    assert_eq!(eval_line("(pat-match '(??x a) '(a))", &e), "((??X))");
+}
+
+#[test]
+fn pat_match_operators() {
+    let e = env();
+    assert_eq!(
+        eval_line("(pat-match '(?is ?n numberp) 42)", &e),
+        "((?N . 42))"
+    );
+    assert_eq!(
+        eval_line("(match-fail-p (pat-match '(?is ?n numberp) 'sym))", &e),
+        "T"
+    );
+    assert_eq!(
+        eval_line("(pat-match '(?and ?x (?is ?_ numberp)) 7)", &e),
+        "((?X . 7))"
+    );
+    assert_eq!(eval_line("(pat-match '(?or 1 2 ?x) 3)", &e), "((?X . 3))");
+    assert_eq!(
+        eval_line("(pat-match '(?not (?is ?_ numberp)) 'sym)", &e),
+        "()"
+    );
+    // Quote escape: match the literal symbol ?X.
+    assert_eq!(eval_line("(pat-match ''?x '?x)", &e), "()");
+    assert_eq!(eval_line("(match-fail-p (pat-match ''?x 'other))", &e), "T");
+}
+
+#[test]
+fn pat_match_dotted_patterns() {
+    let e = env();
+    assert_eq!(
+        eval_line("(pat-match '(?h . ?t) '(1 2 3))", &e),
+        "((?T 2 3) (?H . 1))"
+    );
+    assert_eq!(
+        eval_line("(pat-match '(?a . ?b) '(1 . 2))", &e),
+        "((?B . 2) (?A . 1))"
+    );
+}
+
+// -------------------------------------------------------------- match ----
+
+#[test]
+fn match_clauses_guards_and_default() {
+    let e = env();
+    assert_eq!(
+        eval_line(
+            "(match '(add 1 2)
+               ((add ?a ?b) :when (> ?b ?a) 'ascending)
+               ((add ?a ?b) 'other))",
+            &e
+        ),
+        "ASCENDING"
+    );
+    assert_eq!(
+        eval_line(
+            "(match '(add 2 1)
+               ((add ?a ?b) :when (> ?b ?a) 'ascending)
+               ((add ?a ?b) 'other))",
+            &e
+        ),
+        "OTHER"
+    );
+    assert_eq!(
+        eval_line("(match 99 ((?is ?n numberp) (* ?n 2)) (?_ 'default))", &e),
+        "198"
+    );
+    assert_eq!(
+        eval_line("(match 'zzz ((?is ?n numberp) ?n) (?_ 'default))", &e),
+        "DEFAULT"
+    );
+    // No matching clause: NIL.
+    assert_eq!(eval_line("(match 1 (2 'two))", &e), "()");
+}
+
+#[test]
+fn ematch_signals_match_failure_when_no_clause_matches() {
+    let e = env();
+    // Same clause semantics as MATCH when a clause matches, guards included.
+    assert_eq!(
+        eval_line(
+            "(ematch '(add 2 1)
+               ((add ?a ?b) :when (> ?b ?a) 'ascending)
+               ((add ?a ?b) 'other))",
+            &e
+        ),
+        "OTHER"
+    );
+    // A matching clause whose body is NIL is a match, not a failure.
+    assert_eq!(eval_line("(ematch 3 (?_ nil))", &e), "()");
+    // No matching clause (a failing guard included): a MATCH-FAILURE
+    // condition carrying the datum, where MATCH would return NIL.
+    assert_eq!(
+        eval_line(
+            "(handler-case (ematch '(add 1 2) ((add ?a ?b) :when (> ?a ?b) 'desc))
+               (error (c) (list (match-failure-p c) (error-data c))))",
+            &e
+        ),
+        "(T (MATCH-FAILURE (ADD 1 2)))"
+    );
+    assert_eq!(
+        eval_line(
+            "(handler-case (ematch 7 (2 'two)) (error (c) (error-message c)))",
+            &e
+        ),
+        "\"ematch: no clause matches 7\""
+    );
+    // MATCH-FAILURE-P rejects other conditions and non-conditions.
+    assert_eq!(
+        eval_line(
+            "(handler-case (error \"boom\") (error (c) (match-failure-p c)))",
+            &e
+        ),
+        "()"
+    );
+    assert_eq!(eval_line("(match-failure-p 'match-failure)", &e), "()");
+    // MATCH itself keeps the NIL fall-through.
+    assert_eq!(eval_line("(match 7 (2 'two))", &e), "()");
+}
+
+#[test]
+fn match_help_states_the_question_mark_rule() {
+    let e = env();
+    let doc = eval_line("(documentation 'match)", &e);
+    assert!(doc.contains("MUST START WITH ?"), "{doc}");
+    assert!(doc.contains("LITERAL"), "{doc}");
+    assert!(doc.contains("EMATCH"), "{doc}");
+}
+
+#[test]
+fn match_binds_segments_in_body() {
+    let e = env();
+    assert_eq!(
+        eval_line("(match '(1 2 3 4) ((?x ??rest) (list ?x ??rest)))", &e),
+        "(1 (2 3 4))"
+    );
+}
+
+#[test]
+fn destructuring_bind_success_and_error() {
+    let e = env();
+    assert_eq!(
+        eval_line(
+            "(destructuring-bind (?a (?b . ?c)) '(1 (2 3 4)) (list ?a ?b ?c))",
+            &e
+        ),
+        "(1 2 (3 4))"
+    );
+    let out = eval_line(
+        "(handler-case (destructuring-bind (?a ?b) '(1) ?a) (error (er) 'no-match))",
+        &e,
+    );
+    assert_eq!(out, "NO-MATCH");
+}
+
+// -------------------------------------------------------------- sgrep ----
+
+#[test]
+fn sgrep_finds_all_matching_subforms() {
+    let e = env();
+    let out = eval_line(
+        "(length (match:sgrep '(setq ?v ?e) '(progn (setq a 1) (if x (setq b (setq c 2))))))",
+        &e,
+    );
+    assert_eq!(out, "3", "must find nested setqs too");
+    // Bindings ride along with each hit.
+    let out = eval_line(
+        "(cdr (assoc '?v (cdr (car (match:sgrep '(setq ?v ?e) '(setq a 1))))))",
+        &e,
+    );
+    assert_eq!(out, "A");
+}
+
+#[test]
+fn sgrep_fn_searches_function_source() {
+    let e = env();
+    let out = eval_line("(length (match:sgrep-fn '(car ?x) 'cadr))", &e);
+    assert_eq!(out, "1", "cadr is (car (cdr x)) — one car call");
+}
+
+// ------------------------------------------------------------ rewrite ----
+
+#[test]
+fn rewrite_is_bottom_up_and_loop_safe() {
+    let e = env();
+    // Innermost-first: nested matches inside a binding are transformed.
+    assert_eq!(
+        eval_line(
+            "(match:rewrite '(plus ?a ?b) '(+ ?a ?b) '(f (plus 1 (plus 2 3))))",
+            &e
+        ),
+        "(F (+ 1 (+ 2 3)))"
+    );
+    // Identity template must not loop.
+    assert_eq!(
+        eval_line("(match:rewrite '(?f ??args) '(?f ??args) '(a (b c)))", &e),
+        "(A (B C))"
+    );
+    // Atoms and dotted tails are rewritten too.
+    assert_eq!(
+        eval_line("(match:rewrite 'x 'y '(x (x . x)))", &e),
+        "(Y (Y . Y))"
+    );
+}
+
+#[test]
+fn instantiate_splices_segments() {
+    let e = env();
+    assert_eq!(
+        eval_line(
+            "(instantiate '(?f ??args done) '((?f . call) (??args 1 2 3)))",
+            &e
+        ),
+        "(CALL 1 2 3 DONE)"
+    );
+}
+
+// -------------------------------------------------------- composition ----
+
+#[test]
+fn match_composes_with_guard_fences() {
+    with_large_stack(|| {
+        let e = env();
+        // Pattern matching inside a fuel fence: the matcher itself is
+        // stdlib Lisp defined outside the fence, charged per call.
+        let out = eval_line(
+            "(with-fuel 100000
+               (match '(inc 41) ((inc ?n) (+ ?n 1)) (?_ 'nope)))",
+            &e,
+        );
+        assert_eq!(out, "42");
+    });
+}
+
+#[test]
+fn rewrite_as_code_transform_end_to_end() {
+    let e = env();
+    // The homoiconic loop: rewrite code, then run it.
+    let out = eval_line(
+        "(eval (match:rewrite '(double ?x) '(* 2 ?x) '(+ (double 10) (double 11))))",
+        &e,
+    );
+    assert_eq!(out, "42");
+}
+
+// -------------------------------------------- positioned sgrep (#171) ----
+
+#[test]
+fn sgrep_source_reports_line_and_column() {
+    let e = env();
+    let out = eval_line(
+        "(match:sgrep-source '(setq ?v ?e)
+           \"(defun a () (setq x 1))\n(defun b ()\n  (when t (setq y 2)))\")",
+        &e,
+    );
+    assert_eq!(
+        out,
+        "((1 1 (SETQ X 1) ((?E . 1) (?V . X))) (2 1 (SETQ Y 2) ((?E . 2) (?V . Y))))"
+    );
+}
+
+#[test]
+fn sgrep_hits_destructure_with_match_itself() {
+    let e = env();
+    // The pattern language consuming its own output.
+    let out = eval_line(
+        "(match (car (match:sgrep-source '(setq ?v ?e) \"(setq z 9)\"))
+           ((?line ?col ?form ?bs) (list ?line ?col (cdr (assoc '?v ?bs)))))",
+        &e,
+    );
+    assert_eq!(out, "(1 1 Z)");
+}
+
+#[test]
+fn read_all_positioned_skips_comments_and_positions_forms() {
+    let e = env();
+    let out = eval_line("(read-all-positioned \";; header\n(a)\n\n  (b c)\")", &e);
+    assert_eq!(out, "(((A) 2 1) ((B C) 4 3))");
+    // Parse errors surface positioned, as ordinary catchable errors.
+    let out = eval_line(
+        "(handler-case (read-all-positioned \"(fine) (broken\") (error (er) 'caught))",
+        &e,
+    );
+    assert_eq!(out, "CAUGHT");
+}
+
+#[test]
+fn sgrep_file_greps_real_source_with_capability() {
+    let e = env();
+    e.enable_feature("READ-FS");
+    // Every hit anchors a (defun name ...) with its line number.
+    let out = eval_line(
+        "(let ((hits (match:sgrep-file '(defun ?name ??rest) \"lib/01-list.lisp\")))
+           (list (> (length hits) 5)
+                 (match (car hits) ((?line ?col ?form ?bs) (> ?line 0)))))",
+        &e,
+    );
+    assert_eq!(out, "(T T)");
+    // And without the capability, a clean gated error.
+    let e2 = env();
+    let out = eval_line(
+        "(handler-case (match:sgrep-file '(defun ?n ??r) \"lib/01-list.lisp\")
+           (error (er) 'gated))",
+        &e2,
+    );
+    assert_eq!(out, "GATED");
+}

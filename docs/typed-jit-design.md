@@ -1,0 +1,512 @@
+# Typed JIT: a pre-runtime type membrane that drives native codegen
+
+Status: design / spike. Relates to #31 (x86-64 JIT), #68 (epic), #111 (tree-walker
+constant factor), #108 (Arc/Send/Sync), #114 (RPLACA aliasing), #62 (TCO).
+
+This document reframes the JIT in #31 around one idea: **the type checker runs
+before runtime, in the Lisp/vau layer, and the types it proves are exactly what
+let the backend emit unboxed native code.** It also pins down the part the REPL
+makes hard — a `defun-typed` must be callable as compiled code the instant it is
+defined, may be *re*compiled later, and the old edition may be thrown away while a
+call to it is still on the stack. So every call is a runtime dispatch.
+
+## 0. The inversion of Coalton
+
+Coalton types a static island inside Common Lisp and then hands it to **SBCL**,
+which does the unboxing via type declarations. Lamedh inverts this: it types the
+island in its own (vau/macro) layer *pre-runtime*, and then has to **be its own
+optimizing backend**, because there is no SBCL underneath. The type work is the
+easy half; the codegen is the lift, and it lives entirely in #31.
+
+The type layer itself is the Turnstile-style elaborating membrane described in the
+design thread: `defun-typed`/`let-typed` run Algorithm W at macro-expansion time,
+reject ill-typed definitions, and emit a typed core. We cannot type the fexpr/vau
+layer itself (Wand's triviality result), so anything touching `defexpr`, `eval`,
+`current-environment`, or create-on-assign `setq` is *outside* the typed island by
+construction. That boundary is not an annoyance — it is the JIT's deopt boundary
+(§3).
+
+## 1. Why types are the speed, not a nicety
+
+#31 wants to emit, for `(* y y 2)`:
+
+```asm
+mov rax, [rdi]      ; load y
+imul rax, rax       ; y * y
+imul rax, 2
+```
+
+That is only valid if `y` is an **unboxed i64**. In lamedh `y` is a `LispVal` —
+a tagged enum (`Number(i64)`, `Float(f64)`, `Cons{car:Rc,cdr:Rc}`,
+`Array(Rc<RefCell<…>>)`, …). With no type proof, the honest codegen for `(* y y)`
+is *not* `imul`; it is:
+
+> match the tag → branch int vs float → `checked_mul` → re-wrap into a
+> `LispVal::Number` → (for some result types) an `Rc` allocation,
+
+preceded by a walk up the `Environment` parent chain to resolve `y`. That is the
+constant factor #111 is trying to shave, and a JIT without types just bakes the
+same boxed dispatch into machine code.
+
+HM types license the fast path. In order of payoff:
+
+1. **Unboxing.** `int64 → i64` register, `float64 → xmm`. The `imul` becomes
+   legal; no tag, no re-box, no `Rc`. This is most of the win and it retires #111
+   and #114 (unboxed scalars are not `Rc`-shared, so the aliasing hazard is gone).
+2. **Devirtualization.** HM proves `(foo x)` targets a known function of known
+   arity and unboxed convention, so we emit a direct call instead of routing every
+   call through a runtime `match` on a `LispVal`.
+3. **Dead-checking.** Monomorphic typed code statically kills the `numberp`
+   guards, the int/float `cond`, and the symbol-table lookups — proven
+   unreachable, not merely shrunk.
+
+Ceiling: a typed unboxed numeric loop can run 50–100× a tree-walker, because it
+removes interpretation overhead *and* boxing. The existing fast `FOR`/`WHILE`
+(one reused frame, in-place counter mutation) is the interpreter hand-approximating
+this for one special form.
+
+## 2. The type *is* the ABI — the membrane is the JIT boundary
+
+The gradual-typing membrane and #31's `universal_call` trampoline are the same
+object. Gradual typing already inserts coercions at the typed/untyped edge:
+re-establish a tag on the way in (`assert numberp`, extract the `i64`), wrap on the
+way out (raw `i64 → LispVal::Number`). **Those coercions are exactly the box/unbox
+marshalling a native↔interpreter ABI needs.** One mechanism, not two.
+
+This dissolves #31's worst hand-waving. Its `execute_interpreted_from_compiled`
+has a literal `FIXME: Need real parameter names` doing `format!("arg_{}", i)`, plus
+a `sync_compiled_cache` dance. With the typed boundary all of that is **derived
+from the function's HM type**: the type gives the arity, the register/stack layout,
+and the per-edge coercions. The only values that cross are the ones the type says
+cross, in the representation the type dictates. No name guessing, no cache to keep
+coherent.
+
+Wand's result even tells you *where* the boundary must be: any point where an
+operative could observe operand syntax or the environment provably cannot be inside
+typed native code, so it is necessarily a membrane crossing / deopt.
+
+## 3. The hard part: REPL redefinition makes every call a dispatch
+
+A `defun-typed` must be runnable as compiled code the moment it is defined; it may
+be recompiled later (better optimization, or a redefinition); and a previous
+compiled edition may need to be discarded **while a call into it is still on the
+stack**. The discipline that makes this safe is an **indirection cell** per
+function — classic Lisp `fdefn`, SBCL-style — plus "code is reclaimed, never
+eagerly freed."
+
+### 3.1 The function cell
+
+Symbols do not bind code directly; they bind a stable cell. Callers always go
+through the cell, so swapping an edition is one atomic store.
+
+```text
+struct FnType { params: Vec<Ty>, ret: Ty }          // the HM signature = the ABI
+
+struct CompiledCode {                                // an executable edition
+    entry:      NativeEntry,                          // fn(*const LispVal, usize) -> LispVal  (boxed ABI)
+    fast_entry: Option<UnboxedEntry>,                 // island-internal unboxed convention
+    pages:      ExecutableMemory,                     // mmap'd; Drop = munmap
+    ty:         FnType,
+    generation: u64,
+}
+
+struct FunctionCell {
+    name:       Symbol,
+    ty:         FnType,                               // current signature
+    interp:     TypedCore,                            // source of truth; ALWAYS runnable
+    compiled:   ArcSwap<Option<Arc<CompiledCode>>>,   // lock-free hot-swap
+    generation: AtomicU64,                            // bumped on every (re)definition
+}
+```
+
+`ArcSwap` (or `arc-swap` crate / a hand-rolled epoch scheme) is the key: a reader
+loads the current `Arc<CompiledCode>` and holds it for the duration of the call; a
+writer `store`s a new edition; the old `Arc` is dropped only when the last in-flight
+caller finishes, at which point `ExecutableMemory::drop` munmaps the pages. That is
+"code is GC'd, not freed" and it is what makes *throwing away the previous edition
+while it is on the stack* safe. This is also the concrete reason to move the cell
+(and the code pages) from `Rc` to `Arc` — i.e. #108.
+
+### 3.2 A call is: load cell → decide interpret/compiled
+
+```text
+fn dispatch(cell: &FunctionCell, args: &[LispVal]) -> LispVal {
+    let cur = cell.compiled.load();                  // cheap atomic load
+    match &*cur {
+        Some(code) => (code.entry)(args.as_ptr(), args.len()),   // native, boxed ABI at the edge
+        None        => interp_typed_core(&cell.interp, args),    // fallback while compiling / when deopted
+    }
+}
+```
+
+Two editions of the *same* function never run from one cell at once for *new*
+calls; but an *old* edition already executing keeps its own `Arc` and runs to
+completion against valid pages. No on-stack replacement is required, because we do
+**not** speculate on the typed island — its types are proven, not guessed. The only
+thing that can deopt is a membrane crossing (§2), and that is a normal call edge,
+not a mid-frame patch.
+
+### 3.3 Define-time and recompile-time behavior
+
+- **On `defun-typed`:** run HM (reject if ill-typed), install the cell with
+  `interp` set and `compiled = None`, then kick compilation. Because the types are
+  proven we compile **eagerly/AOT** (no call-count warmup like #31's thresholds).
+  Until the edition is ready the cell serves the interpreter, so the function is
+  callable *immediately* and gets faster *transparently* when the store lands. If
+  Cranelift is fast enough we can even compile synchronously for small bodies.
+- **On redefinition:** bump `generation`, replace `interp`, `compiled.store(None)`
+  (or store the new edition when ready). In-flight old-edition frames are
+  unaffected; their `Arc` keeps their pages alive until they return.
+
+### 3.4 Inter-function calls and stale direct calls
+
+If compiled `A` bakes a direct `call B_native`, redefining `B` leaves `A` pointing
+at a dead edition. Two policies:
+
+- **(a) call-through-cell (default).** `A` emits `call [B.cell.entry]` — one
+  indirect load per cross-function call. Always correct; redefinition is just the
+  `ArcSwap` store. Costs the last few percent of call speed.
+- **(b) direct + backpatch.** Bake the address and keep a per-cell list of call
+  sites to rewrite on redefinition. Faster steady-state, much more machinery.
+
+For a REPL-first Lisp, default to **(a)**; correctness and trivial invalidation beat
+a few percent. Self-recursion *within* one body may bake direct, since redefining
+replaces the whole body atomically anyway.
+
+### 3.5 Signature changes invalidate typed callers
+
+If `(defun-typed (foo str) …)` is redefined with a different signature, callers
+that were type-checked and compiled against the *old* `FnType` are now potentially
+ill-typed. Sound REPL policy: a `generation` bump on `foo` marks dependent compiled
+editions **stale**; on their next call the cell sees the mismatch and falls back to
+`interp` (which re-checks against the current type at the membrane) and schedules
+recompile. A precise version keeps a reverse dependency edge (callers-of-`foo`) and
+re-runs HM on them; the lazy generation check is the cheap correct floor. Either
+way, the contract at the membrane is the backstop: a value shaped for the old type
+fails the coercion rather than corrupting.
+
+## 4. Backend: lower to Cranelift, do not hand-emit x86
+
+#31 sketches hand-assembled opcode bytes (`0x48, 0x8B, …`) with manual relocations
+— a long, fragile, x86-only road, and an entire "register allocation" phase to
+write. Once HM hands us typed IR with `i64`/`f64`, lower to **Cranelift**: we write
+typed IR, it does instruction selection and register allocation and gives us
+AArch64/portability for free. HM is what makes the lowering trivial — Cranelift IR
+is typed, so we translate `int64 → i64`, never inventing types at the metal. LLVM
+is the heavier alternative if we later want max throughput; Cranelift is the right
+first backend (fast compiles suit a REPL).
+
+## 4a. Prototype status (implemented in `src/jit.rs`)
+
+Stage 1 is built and tested (`src/jit.rs`, `src/jit/tests.rs`, `examples/typed_jit.rs`):
+
+- The membrane (`Jit::define`) elaborates `defun-typed` with a bidirectional
+  checker and rejects ill-typed defs *before runtime*.
+- **HM-lite inference (#135, `src/jit/infer.rs`).** Type agreement is decided by
+  unification over `Ty::Var` with an occurs-check, threaded through elaboration as
+  a substitution; a `resolve` pass drives every node's type to a concrete scalar
+  before a definition is accepted (rejecting both *conflict* — variable forced to
+  two types — and *unresolved/ambiguous* — variable still free). Explicit
+  annotations are principal-type pins; a `let-typed` binding may **omit** its type
+  (`(name init)`) to have it inferred from the initializer, the one
+  surface-compatible inferable position today. This is the foundation the
+  array/string element types (#137/#138) monomorphize on.
+- **Arrays & strings (#137/#138).** `(array T)` with the element type *inferred*
+  (`(array n)`/`(fetch a i)`/`(store a i v)`/`(array-length* a)`); a string is
+  `(array char)`, so native byte indexing/scanning/compare (Levenshtein) emerges
+  for free. The flat representation is a pointer to a `[len, e0, e1, …]` `u64`
+  buffer rooted in the per-call **arena** on `Ctx` (one uniform buffer for every
+  element type). Access is bounds-checked and panic-free (OOB load → 0, store →
+  no-op) across all editions; native `fetch`/`store`/`length` plus a `jit_alloc`
+  trampoline. Membrane: `(array char)` ↔ `LispVal::String`, other arrays ↔
+  `LispVal::Array`.
+- **Typed structs.** `(defstruct-typed Name (field type)…)` registers a struct
+  type (usable in signatures) and generates `make-NAME`/`NAME-FIELD`/
+  `set-NAME-FIELD` as ordinary typed functions over flat one-word-per-field
+  buffers; a struct crosses the membrane as a nominal `LispVal::Struct`, so a
+  plain array with the same shape is not accepted as that struct type. The same
+  type parser is used for `let-typed` annotations, so locals can be pinned to
+  scalar types, arrays, or nominal typed structs.
+- **No traits/subtyping yet.** Type agreement is still equality-based
+  HM unification: a variable may be inferred, but there is no typeclass
+  constraint solving, dictionary passing, row polymorphism, or subtype relation.
+  If/when traits arrive they should be an explicit constraint layer on top of
+  unification, not an accidental weakening of nominal struct identity.
+- **HM under the hood.** `Jit::infer_untyped` types a *fully un-annotated*
+  function (every parameter a fresh variable) when its body is an inferable typed
+  island, with clean rollback otherwise. Exposed as the `jit-optimize` special
+  form: `(jit-optimize (defun f …))` natively compiles `f` and installs an
+  auto-typed membrane that fast-paths typed calls and silently falls back to the
+  dynamic closure for non-matching arguments — transparent "play like a Lisp,
+  optimize like Fortran." Not auto-applied to every `defun` (it would change
+  introspection and the numeric edge semantics, #67).
+- `int64`/`float64`/`bool`/`char`; `+ - * / mod`, `< > <= >= = /=`,
+  `and`/`or`/`not`, `if`, `let-typed`, arrays, structs, sequencing, and **calls**
+  — self-recursion, cross-function, and (via `Jit::declare`) mutual recursion.
+  Runtime values are unboxed `u64` words; the static type says how each op reads
+  its word, so there is no tag in the hot path.
+- The cell dispatch and redefinition model from §3 are real: calls route through
+  the registry by id, redefining a callee is an edition swap, and a call pins
+  (`Rc`-clones) the edition it runs.
+- The `agree` helper runs every example through both editions as a differential
+  check; arrays, strings, structs, and inferred functions are all covered.
+
+Two backends share the `TypedFn` cell:
+- **Closures** (default build): lowers the typed core to a tree of unboxed-`u64`
+  closures. Ties the JIT's *own* unboxed interpreter; ~16× the **boxed** evaluator
+  on `fib(28)`.
+- **Native Cranelift** (`--features jit`): `src/jit/native.rs` lowers the typed
+  core to a native function (`int64` in registers, `float64` via bitcast, `bool`
+  as `0/1`). **Typed→typed calls are direct**: each function has a heap-stable
+  *entry cell* holding its current native entry; a call loads that cell and
+  `call_indirect`s the callee's native code, falling back to the §2 host
+  trampoline only when the callee has no native edition. Because the call goes
+  through the cell (not a baked address), recursion and redefinition need no
+  relocation/hot-patching, and the cell address survives registry `Vec` growth.
+  ~**270×** the boxed evaluator on `fib(28)`. `if`/`and`/`or` lower via a per-node
+  result stack slot to avoid block-argument API churn across Cranelift releases.
+
+Dispatch prefers the native edition, then the closure edition, then the
+interpreter; each is pinned (`Rc`-cloned) for the call, and a `NativeEdition` owns
+its `JITModule` so its code is freed only when the last in-flight caller drops it.
+
+### Landed surface area
+- **`DECLARE-TYPED`** `(declare-typed (name ret) ((arg ty)...))` forward-declares a
+  signature, so mutually-recursive typed functions can be written at the REPL.
+- **Membrane interop**: typed functions installed as `LispVal::Native` convert
+  arguments type-directed (`nil`/non-`nil` → `bool`, `Number` widens to
+  `float64`) and re-box results (`bool` → `T`/`NIL`), so a typed predicate is
+  usable as an ordinary `if` condition and `(+ (fib 15) 1)` just works.
+- **Compilable types**: `int64` (`Number`), `float64` (`Float`), `bool` (`T`/`NIL`)
+  — the unboxable scalars. Non-scalar `LispVal`s (cons, string, symbol, …) are
+  intentionally outside the typed core and rejected at the membrane.
+- **Storage stability**: the registry is a `Vec<Rc<TypedFn>>` + name→id `HashMap`;
+  function identity is the stable id, per-function state (cells, editions) lives
+  behind the `Rc` (heap-stable across `Vec` growth), and locals are fixed slot
+  indices. Stress-tested with a 200-function chain that forces reallocation.
+
+**It lands in the language.** `DEFUN-TYPED` is a real special form: the registry
+lives in `SharedState` (shared across the whole environment chain), and a
+successful definition installs a `LispVal::Native` entry under the function name.
+So a typed function is callable from ordinary untyped Lisp through the membrane —
+`(+ (fib 15) 1)` works at the REPL, an ill-typed definition is rejected before it
+binds anything, and redefinition updates behavior live. Typed→typed calls (self,
+cross-function) route through the registry by id, not back through the evaluator.
+The one boundary not yet exposed in surface syntax is a *forward declaration* (for
+REPL-level mutual recursion); it exists in the Rust API as `Jit::declare`.
+
+### 0.4.0: native loops, inlining, stack allocation, array-of-records, typed arrays (#412)
+
+The 0.4.0 arc widened the compiled surface and added layout/allocation
+optimizations. All are executed identically across the Core interpreter,
+closure compiler, and Cranelift backend (bit-for-bit differential tests).
+
+- **Native loops and local assignment.** New `Core` nodes `Assign`, `While`,
+  and `For` (`src/jit/types.rs`, elaborated in `src/jit/elaboration.rs`:
+  `elab_setq`/`elab_while`/`elab_for`). `setq` compiles only when its target
+  is a local slot (param/`let` binding); a dynamic/global target keeps the
+  whole function interpreted. `for` is inclusive and bounded; counter overflow
+  breaks the loop **without** setting `OVERFLOW`, matching the tree-walker.
+  Both loop forms evaluate to `0`/`NIL` (statement nodes).
+- **Core-level inlining** (`src/jit/registry.rs`, `TypedFn::inline_candidates`).
+  A callee is spliced into the caller at compile time only when it is under
+  `INLINE_NODE_BUDGET` (30 Core nodes), already defined, not a self-call, and
+  neither directly nor transitively recursive with the caller. An `inlined_from`
+  set drives dependent invalidation: redefining an inlinee recompiles every
+  inliner (`recompile_inline_dependents`).
+- **Stack allocation** (`src/jit/native.rs`, `try_stack_alloc`). A
+  `Let`-bound `ArrayNew(LitI n)` with `n` in `0..=4096`, or a `StructNew`
+  whose field count is `<= 4096`, is allocated in a Cranelift `StackSlot`
+  instead of the call arena when `allocation_escapes` (`types.rs`) proves the
+  slot is used only as the direct base/target of array/field get/set/len — any
+  other appearance (call argument, return, assignment source, `ArrayMap2`
+  operand) is an escape and forces the arena path.
+- **Contiguous array-of-records** (`ArrayNewStride`/`ArraySetStride`/
+  `InlineFieldGet`/`InlineFieldSet`). An `(array Struct)` whose struct has only
+  scalar fields (`StructDef::stride()` is `Some`) is laid out inline,
+  `stride` words per element. The elaborator (`try_stride_binding`,
+  `stride_walk`) fuses `(store a i (make-Struct …))` and `(field (aref a i))`
+  into stride loads/stores only when every reachable use of the bound array is
+  a recognized safe pattern; any unrecognized use leaves both cores on the
+  general one-pointer-per-element layout.
+- **May-mutate write-back elision** (`TypedFn::may_mutate`,
+  `recompute_may_mutate`). A flat scalar-array parameter the body provably
+  never writes through skips the post-call copy-out at the membrane
+  (`call_with_array_writeback`). Conservative: a spurious `true` only costs a
+  redundant copy.
+- **`LispVal::TypedArray` zero-copy membrane** (`Value::TypedArray`,
+  `types.rs` `to_word`). A typed array whose declared element type matches the
+  parameter's array element type (`elem_ty_matches`) passes its raw
+  `[len, e0, …]` buffer pointer straight into the native call — no copy in, and
+  no write-back out, so in-place mutations are shared with the caller. A
+  mismatched element type does not match this arm and is rejected at the
+  membrane rather than reinterpreted. Builtins `typed-array`/`typed-array-p`.
+
+### 0.5.0: `Ty::Boxed`, an opaque handle to an arbitrary `LispVal` (#476)
+
+Everything above types a *closed* set of unboxable scalars/compounds — `int64`,
+`float64`, `bool`, `char`, arrays and structs over those. `Ty::Boxed` (surface
+name `boxed`) widens the compileable lattice by exactly one escape hatch: a
+compileable *handle* to an arbitrary `LispVal` that the typed core carries
+around, passes, and returns, but never looks inside except through a small,
+closed set of intrinsics.
+
+- **Representation: a table index, not a pointer.** A `boxed` value is a
+  native `u64` like every other compiled scalar, but it is not the `LispVal`
+  itself — it is a 1-based index into `Ctx.boxed: RefCell<Vec<LispVal>>`, a
+  root table allocated fresh for each top-level call into typed code. Word `0`
+  is reserved for boxed `NIL` and needs no table slot at all, which is what
+  lets a freshly `jit_alloc`'d, zero-filled `(array boxed)` read as all-`NIL`
+  with no initialization pass. Boxing pushes a clone of the `LispVal` onto the
+  table and returns its index (`Ctx::box_value`); unboxing clones the entry
+  back out (`Ctx::unbox`), recording a boxed-error and substituting `NIL` on an
+  out-of-range index rather than panicking, matching every other `Ctx` error
+  discipline in this module.
+
+  A raw `*const LispVal` was the tempting alternative and was rejected: the
+  call arena's pointer-stability trick (`Box<[u64]>`, used for arrays/structs)
+  depends on a buffer that never moves once allocated, but `Ctx.boxed` is a
+  plain growable `Vec<LispVal>`, and a pointer taken before a `push` that
+  triggers reallocation would dangle silently — exactly the kind of bug a
+  differential test across tiers would not catch, because all three tiers
+  would dangle together. An index into the table has no such hazard: it stays
+  valid across the table's own growth, and it is meaningless once the table
+  that produced it is gone (see the next point), so there is nothing to catch
+  a stale index doing.
+
+- **Call-scoped lifetime, and why that answers the GC question.** `Ctx` (and
+  therefore its `boxed` table) lives for exactly one top-level membrane call:
+  every tier threads the same `&Ctx` through the whole call tree (portable
+  Core evaluation, the closure edition, and — via `call_indirect` on a shared
+  `ctx_ptr` — native-to-native calls), and it is dropped when that top-level
+  call returns. A handle is only ever valid *while the call that produced it
+  is still running*; it cannot be stashed in a global, closed over past the
+  call's return, or observed by `fork_world`, because handles never enter a
+  `LispVal` — they exist only as `u64` words inside typed code and inside
+  `Ctx`, both of which end together. This sidesteps the original issue's GC
+  question entirely: there is no boxed-value lifetime to manage beyond "as
+  long as the call lasts," because nothing outlives the call that could hold a
+  handle in the first place.
+
+  The corollary the doc comments call out explicitly: the table is
+  **append-only per call**. A compiled loop that boxes a fresh value every
+  iteration grows the table linearly for the lifetime of that one call — fine
+  for a boundary box (once per call, as in `lib/45-hashtable.lisp`'s `LHT-PROBE`), a
+  latent cost for a hypothetical box-in-a-tight-loop pattern. A free list is a
+  possible follow-up; v1 does not need one because nothing in the accepted
+  scope boxes per-iteration.
+
+- **The aliasing property, and why it is a feature, not a leak.** Boxing does
+  not deep-copy: `ctx.box_value(lv)` stores `lv.clone()`, and `LispVal`'s
+  `Shared`-backed variants (`Array`, `Cons`, `Symbol`, `HashTable`, and
+  `String` where applicable) clone the `Rc`/`RefCell` handle, not its
+  contents. So a `store`/`fetch` through a boxed handle to one of those
+  variants mutates the *same* underlying object the caller holds — there is
+  no write-back path at all, because there is nothing to write back; the
+  handle and the caller's own value are already the same allocation. This is
+  exactly the property the `#216` write-back pass gives typed scalar arrays on
+  purpose, arriving here for free from `Rc` semantics instead of an explicit
+  copy-out. The inline `LispVal` variants (`Number`, `Float`, `Char`, `Nil`)
+  are ordinary value copies on box/unbox, which is sound only because they are
+  immutable — there is no "same object" for a plain machine word to alias.
+
+- **v1 non-goals (§3 of the design plan; deliberately out of scope, not
+  merely undone):**
+  - **No `CAR`/`CDR` or any other compiled introspection** through a boxed
+    handle. A `boxed` value is inert cargo to the typed core; the only things
+    that look inside one are the five intrinsics below.
+  - **No cons allocation** from typed code — a handle cannot be built by
+    consing two other values together inside the typed island.
+  - **No boxed arithmetic.** `+`/`-`/`*`/`/`/`mod` refuse boxed operands at
+    elaboration with a message naming exactly what a `boxed` value does
+    support (movement, `equal`, `hash-code`, general-array access), matching
+    the discipline `verify_core` re-checks at the Core level so a malformed
+    core fails a test, not a runtime assertion.
+  - **No `Cmp` node at boxed type.** Two handles may denote the same object
+    through different indices, so ordering/equality-as-`Cmp` is not
+    elaborated for `boxed` operands at all; identity/value questions go
+    through `BoxedEqual` instead, which unboxes and defers to
+    `PartialEq for LispVal` — the same relation the tree-walker's `equal`
+    already implements, so there is nothing new to keep in sync.
+  - **No narrowing.** A `boxed` value is never refined to "known to be a
+    `Symbol`" or similar inside typed code; if that distinction matters, the
+    value must cross back out to the interpreter to be inspected.
+  - **No boxed → `int64` coercion.** Deferred; the honest reason is that a
+    checked coercion needs exactly the kind of type-tag inspection §3 already
+    rules out for v1, and nothing in the accepted scope (the LHT probe loop)
+    needs it — `LHT-FIND`/`-PUT!`/`-GET` stay interpreted for this reason and
+    say so rather than quietly reaching for a shortcut.
+  - **`Ty::Boxed` stays distinct from `Ty::Any`.** `Any` remains the gradual
+    top type or JIT-general escape hatch; `Boxed` is deliberately a narrower,
+    single-purpose "opaque but nameable" type with its own membrane rules
+    (§4), and unifying the two would blur exactly the refusal set above.
+
+  **The five intrinsics** (`BoxedOp` in `src/jit/types.rs`, dispatched through
+  one shared `boxed_op` in `src/jit/runtime.rs` so all three tiers can never
+  diverge): `BoxedEqual` (→ `bool`, via `PartialEq for LispVal`), `BoxedHash`
+  (→ `int64`, via `#474`'s `hash_code`), and the general-array trio
+  `BoxedAref`/`BoxedAset`/`BoxedLen` (handle × `int64` [× handle] →
+  handle/`int64`), which error-record — never panic — on a non-array receiver
+  or an out-of-range index, in each case matching the tree-walker's own
+  `FETCH`/`STORE`/`ARRAY-LENGTH*` wording for the same misuse. A general array
+  crosses the boundary as *one* handle word rather than being materialized
+  element-by-element, which is why `boxed` is what makes an `O(1)`-per-call
+  boundary for a general (non-typed-array) array possible at all — the
+  alternative (a copy-in/copy-out `(array boxed)` membrane) would make every
+  call touching such an array `O(n)` regardless of how little of it the
+  callee actually reads.
+
+  **Membrane refusals, each with its own test:** a `boxed` element inside a
+  `TypedArrayObj`'s zero-copy fast path is refused by `elem_ty_matches`, and
+  `is_flat_scalar_array` excludes any type involving `Boxed` from the `#216`
+  write-back pass — both because a caller's raw scalar buffer must never be
+  reinterpreted as (or have written into it) a set of table indices, which
+  would be meaningless outside the call that produced them. `NativeTy::from_ty`
+  maps `Ty::Boxed` to `None` rather than falling into its wildcard case, so a
+  raw native entry point (which has no `Ctx` table to resolve a handle
+  against) simply cannot be given a boxed-typed signature.
+
+  **Inference policy:** `Boxed` is never inferred — it enters a signature only
+  where `defun-typed`/`declare-typed` writes it explicitly. An
+  otherwise-un-annotated function that would resolve to `Any`/`Symbol`/`List`
+  keeps falling back to the interpreter exactly as before #476; nothing about
+  this feature silently changes what compiles today.
+
+## 5. The spike
+
+Smallest thing that proves the whole thesis end to end. See
+`docs/spike/typed_jit_spike.rs` (illustrative, not wired into the crate).
+
+1. Pick one monomorphic typed function:
+   `(defun-typed (sq int64) ((x int64)) (* x x))`.
+2. `infer`: confirm `sq : int64 -> int64`, emit typed core.
+3. Lower the typed core to Cranelift IR (`iadd`/`imul` on `i64`), JIT to an entry.
+4. Install a `FunctionCell` with `interp` = the AST and `compiled` = the JIT
+   edition; route the symbol's binding through `dispatch`.
+5. One contract trampoline as the membrane: boxed `LispVal::Number ↔ i64` at the
+   entry, so the interpreter and any untyped caller can still call `sq`.
+6. Redefinition test: redefine `sq`, assert the old `Arc<CompiledCode>` is dropped
+   only after in-flight calls return, and that new calls hit the new edition.
+
+Success = identical result to the tree-walker, ~50× on a tight `(sq …)` loop, and a
+clean redefinition with no use-after-free. Then widen: `+ - < if let-typed`, then
+direct typed→typed calls (policy (a)), then `float64`, then self-recursive loops
+(tie into #62 TCO so a typed tail self-call becomes a backedge, not a frame).
+
+## 6. Staging
+
+1. **Type membrane** (`lib`-level `defun-typed`/`let-typed`, Algorithm W) — no
+   backend yet; rejects ill-typed defs, emits typed core. Independently useful.
+2. **FunctionCell + dispatch** in the interpreter (still interpreting) — proves the
+   redefinition/identity model with zero codegen risk. Pure refactor of how the
+   evaluator resolves a call to a typed function.
+3. **Cranelift island** for monomorphic int functions (the spike) behind a
+   `jit` cargo feature. It is enabled by default since 0.2.0; use
+   `--no-default-features` to exercise the dependency-light typed checker path.
+4. **Widen** types and call forms; AArch64 falls out of Cranelift.
+5. **Membrane polish:** contract coercions as the universal trampoline; deopt at
+   every fexpr/`eval` edge.
+
+Throughout: the typed core stays the reference model (the #68 mandate), the
+interpreter is always a correct fallback in every cell, and nothing in `src/`
+depends on the backend unless the `jit` feature is on.

@@ -1,0 +1,2042 @@
+//! Native-code backend for the typed JIT, via Cranelift. Compiled in only with
+//! `--features jit`.
+//!
+//! Each typed function is lowered to a native function with the ABI
+//! `extern "C" fn(args: *const u64, ctx: *const c_void) -> u64`, where `args`
+//! points to the (unboxed) parameter words and `ctx` is an opaque pointer to the
+//! Rust [`Ctx`]. Leaf work — arithmetic, comparisons, `if`/`and`/`or`, `let` —
+//! is fully native on unboxed machine words (`int64` in registers, `float64` via
+//! bitcast, `bool` as `0`/`1`).
+//!
+//! **Calls** load the callee's current native entry from its heap-stable *entry
+//! cell* and, if present, call it directly (`call_indirect`); otherwise they fall
+//! back to a host trampoline [`jit_trampoline`] that re-enters `Ctx::call` (the
+//! design doc's `universal_call`) to reach the callee's closure/interpreter
+//! edition. Because the call goes through the cell — not a baked code address —
+//! recursion and redefinition need no Cranelift relocation or hot-patching: a
+//! redefined callee just updates its cell, and the cell address survives registry
+//! `Vec` growth (it is a heap `Box`).
+//!
+//! Local variables (parameters, `let` bindings, `for` counters) are lowered to
+//! cranelift-frontend SSA [`Variable`]s (`declare_var`/`def_var`/`use_var`),
+//! which perform proper SSA construction — inserting block parameters at CFG
+//! merge points automatically, so loop counters and accumulators stay in
+//! registers instead of paying a stack round-trip per touch. Every slot is a
+//! `u64` word (floats travel bit-cast), so every Variable is `types::I64`.
+//! `if`/`and`/`or` and bounds-checked-access merges pass their result as a
+//! single block parameter on the merge block.
+
+use super::{ArrOp, BinOp, CmpOp, Core, Ctx, NumKind, allocation_escapes};
+use core::ffi::c_void;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{
+    AbiParam, BlockArg, InstBuilder, MemFlagsData, SigRef, Signature, StackSlotData, StackSlotKind,
+    Value, types,
+};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{Linkage, Module, default_libcall_names};
+
+/// The native calling convention for a compiled typed function.
+type NativeEntry = unsafe extern "C" fn(*const u64, *const c_void) -> u64;
+
+/// Element/field-count ceiling for stack-allocating a `Core::Let`-bound
+/// `Core::ArrayNew`/`Core::StructNew` buffer directly on this call frame
+/// (jit/core-loops stack-allocation follow-up) instead of the arena. Purely a
+/// frame-size guard against an unbounded `StackSlot` for some large constant
+/// size — above it, the allocation just takes the ordinary arena path, same
+/// as any non-constant-size or escaping allocation. Well above realistic
+/// temporary sizes (a handful of loop-local accumulator/scratch elements)
+/// while keeping the added stack frame small relative to the interpreter's
+/// existing large-stack budget.
+const MAX_STACK_ALLOC_ELEMENTS: i64 = 4096;
+
+/// A finalized native edition. Owns its `JITModule`, whose `Drop` frees the
+/// executable memory — so keeping this alive (e.g. behind an `Arc` that an
+/// in-flight call has cloned) keeps the code mapped.
+pub struct NativeEdition {
+    // Field order matters for drop: `entry` is a pointer into `module`'s code.
+    entry: NativeEntry,
+    _module: JITModule,
+}
+
+// SAFETY (issue #424 raw native entry): a `NativeEdition` is shared across
+// threads (behind an `Arc`) and called concurrently from a `NativeFnHandle`.
+// This is sound for the two — and only two — operations performed on a
+// `NativeEdition` after it is constructed:
+//
+//  1. `call` (the `entry` fn pointer). After `finalize_definitions`, `entry`
+//     points into immutable, read-execute code memory. Invoking it reads only
+//     that finalized code and the caller-supplied per-call `Ctx` (each call
+//     builds its own on its own stack — `Ctx::leaf`); it never dereferences
+//     `_module`. The `JITModule`'s one non-`Sync` field is `symbols:
+//     RefCell<..>`, touched exclusively during *compilation*/relocation, which
+//     completed before any handle could exist — so concurrent calls never race
+//     on it. Cranelift's own memory provider is `+ Send` (`Box<dyn
+//     JITMemoryProvider + Send>`), and the finalized code pages are immutable.
+//
+//  2. `Drop` → `JITModule`'s drop frees (unmaps) the code memory. It runs
+//     exactly once, when the last `Arc` reference is dropped — at which point,
+//     by `Arc`'s refcount guarantee, no other reference exists and no call can
+//     be in flight. `munmap` is thread-agnostic.
+//
+// No other `JITModule` method is reachable through a `NativeEdition` (its
+// `_module` field is private and never exposed), so the `RefCell`/`!Sync`
+// interior is unreachable post-finalize. Moving across threads (`Send`) and
+// sharing (`Sync`) are therefore both sound for this restricted API surface.
+unsafe impl Send for NativeEdition {}
+unsafe impl Sync for NativeEdition {}
+
+impl std::fmt::Debug for NativeEdition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeEdition")
+    }
+}
+
+impl NativeEdition {
+    /// Invoke the native function. `args` must have exactly the parameter count;
+    /// `ctx` is the live call context (passed opaque for re-entrant calls).
+    ///
+    /// # Safety
+    /// `ctx` must point to the `Ctx` that owns the function table for the whole
+    /// duration of the call (the trampoline dereferences it).
+    pub unsafe fn call(&self, args: &[u64], ctx: *const c_void) -> u64 {
+        unsafe { (self.entry)(args.as_ptr(), ctx) }
+    }
+
+    /// The native entry pointer as an integer, to publish into the function's
+    /// entry cell for direct calls from other compiled functions.
+    pub fn entry_addr(&self) -> usize {
+        self.entry as *const () as usize
+    }
+}
+
+/// The host trampoline every native call routes through. Re-enters the registry
+/// so self/cross/mutual calls and redefinition all work without native-level
+/// relocation.
+///
+/// # Safety
+/// Called only from Cranelift-generated code with arguments it constructed:
+/// `ctx` is the pointer threaded from the entry, `args`/`argc` describe a buffer
+/// of `argc` `u64` words.
+unsafe extern "C" fn jit_trampoline(
+    ctx: *const c_void,
+    id: u64,
+    args: *const u64,
+    argc: u64,
+) -> u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    let slice = unsafe { std::slice::from_raw_parts(args, argc as usize) };
+    ctx.call(id as usize, slice)
+}
+
+/// Host trampoline for a *cross*-function tail call (issue #133 Tier 2a).
+/// Unlike [`jit_trampoline`] (which re-enters `Ctx::call` and so grows the
+/// native Rust stack by one frame per call — fine for an ordinary,
+/// non-tail-position call, unsound for a tail-recursive chain of unbounded
+/// depth), this records the target and its argument words on `Ctx` and
+/// returns immediately: the native function that called this then returns
+/// normally (ordinary SystemV return, no calling-convention change), and
+/// `TypedFn::invoke`'s dispatch loop (not this function, and not any native
+/// code) picks up the pending call and re-dispatches — a fresh top-level
+/// call each time, so native stack usage is O(1) regardless of chain depth.
+/// Cranelift's `tail` calling convention / `return_call_indirect` was
+/// evaluated and rejected for this (Tier 2b, deferred): adopting it would
+/// require every typed function to also expose a distinct SystemV entry
+/// thunk (Rust cannot call a `Tail`-CC function directly), plus reworking
+/// the entry-cell Rc-pinning discipline, since `return_call` eliminates the
+/// caller's frame and so invalidates the "pin the callee's edition for the
+/// duration of the (still-existing) caller frame" invariant the redefinition
+/// story depends on. This trampoline sidesteps both problems entirely by
+/// never changing any function's calling convention.
+///
+/// # Safety
+/// Called only from Cranelift-generated code with arguments it constructed:
+/// `ctx` is the pointer threaded from the entry, `args`/`argc` describe a
+/// buffer of `argc` `u64` words that are copied out immediately (need not
+/// outlive this call).
+unsafe extern "C" fn jit_set_pending_tail(
+    ctx: *const c_void,
+    id: u64,
+    args: *const u64,
+    argc: u64,
+) {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    let slice = unsafe { std::slice::from_raw_parts(args, argc as usize) };
+    ctx.set_pending_tail(id as usize, slice);
+}
+
+/// Resolve a pending cross-function tail call left behind by a *direct*
+/// native→native call. `emit_cross_tail_call`'s contract is that the
+/// Rust-level dispatch loop drains the pending cell — but a direct native
+/// call site returns straight into native code, so without this hook the
+/// pending call would survive until the top-level `TypedFn::invoke` loop
+/// and its result would *replace* the outer function's own return value
+/// (found by the brutal differential fuzzer the moment float functions
+/// started compiling natively; small repros hide it because the inliner
+/// splices small callees away). Called after every direct native call:
+/// returns `raw` untouched when nothing is pending, else dispatches the
+/// deferred chain and returns its final result.
+///
+/// # Safety
+/// Called only from Cranelift-generated code; `ctx` is the pointer threaded
+/// from the entry.
+unsafe extern "C" fn jit_resolve_pending_tail(ctx: *const c_void, raw: u64) -> u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    match ctx.take_pending_tail() {
+        None => raw,
+        // `invoke` drives the trampoline until no pending call remains, so
+        // arbitrarily long deferred chains resolve here in O(1) stack.
+        Some((id, tail_args)) => ctx.funcs[id].invoke(&tail_args, ctx),
+    }
+}
+
+/// Compile `core` (a function body with `n_params` parameters and `n_slots`
+/// total local slots) to a native edition.
+///
+/// `cell_addrs[id]` is the address of function `id`'s entry cell — a stable
+/// heap word holding that function's current native entry pointer (or 0). A
+/// `Call(id, ..)` loads that word and, if non-zero, calls the callee's native
+/// code **directly**; otherwise it falls back to the host trampoline. The cell
+/// is a heap `Box`, so its address is stable across registry growth (Vec
+/// reallocation) and across redefinition (the word is updated in place).
+pub fn compile_native(
+    core: &Core,
+    self_id: usize,
+    n_params: usize,
+    n_slots: usize,
+    cell_addrs: &[usize],
+    param_counts: &[usize],
+    reclaim: bool,
+) -> Result<NativeEdition, String> {
+    // opt_level defaults to "none" — turn on Cranelift's egraph optimizer
+    // (measured on the embedder bench: see benchmarks/embedder/README.md).
+    let mut jb = JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names())
+        .map_err(|e| format!("{e:?}"))?;
+    jb.symbol("jit_trampoline", jit_trampoline as *const u8);
+    jb.symbol("jit_set_pending_tail", jit_set_pending_tail as *const u8);
+    jb.symbol(
+        "jit_resolve_pending_tail",
+        jit_resolve_pending_tail as *const u8,
+    );
+    jb.symbol("jit_arena_mark", super::jit_arena_mark as *const u8);
+    jb.symbol("jit_arena_reclaim", super::jit_arena_reclaim as *const u8);
+    jb.symbol("jit_alloc", super::jit_alloc as *const u8);
+    jb.symbol("jit_alloc_stride", super::jit_alloc_stride as *const u8);
+    jb.symbol("jit_array_oob", super::jit_array_oob as *const u8);
+    jb.symbol("jit_bad_char", super::jit_bad_char as *const u8);
+    jb.symbol("jit_ftrans", super::jit_ftrans as *const u8);
+    jb.symbol("jit_ftrans2", super::jit_ftrans2 as *const u8);
+    jb.symbol("jit_boxed_op", super::jit_boxed_op as *const u8);
+    jb.symbol("jit_enter_call", super::jit_enter_call as *const u8);
+    jb.symbol("jit_exit_call", super::jit_exit_call as *const u8);
+    jb.symbol("jit_for_step_zero", super::jit_for_step_zero as *const u8);
+    let mut module = JITModule::new(jb);
+    let ptr = module.target_config().pointer_type();
+
+    // Signature of a compiled typed function, for direct `call_indirect`.
+    let mut callee_sig = Signature::new(module.target_config().default_call_conv);
+    callee_sig.params.push(AbiParam::new(ptr));
+    callee_sig.params.push(AbiParam::new(ptr));
+    callee_sig.returns.push(AbiParam::new(types::I64));
+
+    // Imported trampoline signature: (ctx, id, args*, argc) -> u64.
+    let mut tsig = module.make_signature();
+    tsig.params.push(AbiParam::new(ptr));
+    tsig.params.push(AbiParam::new(types::I64));
+    tsig.params.push(AbiParam::new(ptr));
+    tsig.params.push(AbiParam::new(types::I64));
+    tsig.returns.push(AbiParam::new(types::I64));
+    let tramp_id = module
+        .declare_function("jit_trampoline", Linkage::Import, &tsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported cross-function tail-call trampoline signature (issue #133
+    // Tier 2a): (ctx, id, args*, argc) -> (), no return value.
+    let mut ptsig = module.make_signature();
+    ptsig.params.push(AbiParam::new(ptr));
+    ptsig.params.push(AbiParam::new(types::I64));
+    ptsig.params.push(AbiParam::new(ptr));
+    ptsig.params.push(AbiParam::new(types::I64));
+    // Resolver signature: (ctx, raw_result) -> u64.
+    let mut rptsig = module.make_signature();
+    rptsig.params.push(AbiParam::new(ptr));
+    rptsig.params.push(AbiParam::new(types::I64));
+    rptsig.returns.push(AbiParam::new(types::I64));
+    let resolve_pending_id = module
+        .declare_function("jit_resolve_pending_tail", Linkage::Import, &rptsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    let pending_tail_id = module
+        .declare_function("jit_set_pending_tail", Linkage::Import, &ptsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported arena mark/reclaim (issue #212): (ctx) -> mark, (ctx, mark) -> ().
+    let mut marksig = module.make_signature();
+    marksig.params.push(AbiParam::new(ptr));
+    marksig.returns.push(AbiParam::new(types::I64));
+    let arena_mark_id = module
+        .declare_function("jit_arena_mark", Linkage::Import, &marksig)
+        .map_err(|e| format!("{e:?}"))?;
+    let mut reclaimsig = module.make_signature();
+    reclaimsig.params.push(AbiParam::new(ptr));
+    reclaimsig.params.push(AbiParam::new(types::I64));
+    let arena_reclaim_id = module
+        .declare_function("jit_arena_reclaim", Linkage::Import, &reclaimsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported allocator: (ctx, n) -> *mut u64, for array/struct allocation.
+    let mut asig = module.make_signature();
+    asig.params.push(AbiParam::new(ptr));
+    asig.params.push(AbiParam::new(types::I64));
+    asig.returns.push(AbiParam::new(ptr));
+    let alloc_id = module
+        .declare_function("jit_alloc", Linkage::Import, &asig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported inline (array-of-structs) allocator (jit/core-loops follow-
+    // up): (ctx, n, stride) -> *mut u64. See `Core::ArrayNewStride`.
+    let mut asig_stride = module.make_signature();
+    asig_stride.params.push(AbiParam::new(ptr));
+    asig_stride.params.push(AbiParam::new(types::I64));
+    asig_stride.params.push(AbiParam::new(types::I64));
+    asig_stride.returns.push(AbiParam::new(ptr));
+    let alloc_stride_id = module
+        .declare_function("jit_alloc_stride", Linkage::Import, &asig_stride)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported out-of-bounds index reporter (issue #282): (ctx, idx, len,
+    // is_store) -> (). Called from the else-arm of a guarded FETCH/STORE to
+    // record the evaluator's index error on `Ctx`; the native code still
+    // yields its memory-safe substitute (fetch → 0, store → no-op).
+    let mut oobsig = module.make_signature();
+    oobsig.params.push(AbiParam::new(ptr));
+    oobsig.params.push(AbiParam::new(types::I64));
+    oobsig.params.push(AbiParam::new(types::I64));
+    oobsig.params.push(AbiParam::new(types::I64));
+    let array_oob_id = module
+        .declare_function("jit_array_oob", Linkage::Import, &oobsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported CODE-CHAR range reporter (issue #281): (ctx, n) -> (). Called
+    // from the out-of-range arm of a CODE-CHAR narrowing to record the
+    // evaluator's range error on `Ctx`; the native code still masks the value
+    // to a byte itself.
+    let mut bcsig = module.make_signature();
+    bcsig.params.push(AbiParam::new(ptr));
+    bcsig.params.push(AbiParam::new(types::I64));
+    let bad_char_id = module
+        .declare_function("jit_bad_char", Linkage::Import, &bcsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported libm float-intrinsic trampoline (`sin`/`cos`/`tan`/`exp`/
+    // `round`): (opcode, x) -> result word. Pure math, no `Ctx`.
+    let mut ftsig = module.make_signature();
+    ftsig.params.push(AbiParam::new(types::I64));
+    ftsig.params.push(AbiParam::new(types::F64));
+    ftsig.returns.push(AbiParam::new(types::I64));
+    let ftrans_id = module
+        .declare_function("jit_ftrans", Linkage::Import, &ftsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported binary float-intrinsic trampoline (`expt`, #398):
+    // (opcode, x word, y word) -> result word. Pure math, no `Ctx`.
+    let mut ft2sig = module.make_signature();
+    ft2sig.params.push(AbiParam::new(types::I64));
+    ft2sig.params.push(AbiParam::new(types::I64));
+    ft2sig.params.push(AbiParam::new(types::I64));
+    ft2sig.returns.push(AbiParam::new(types::I64));
+    let ftrans2_id = module
+        .declare_function("jit_ftrans2", Linkage::Import, &ft2sig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported boxed-handle intrinsic trampoline (issue #476 phase 3b/3c):
+    // (ctx, opcode, a, b, c) -> result word — follows `jit_ftrans`'s
+    // single-opcode-dispatch shape (`BoxedOp::opcode`/`from_opcode`, mirroring
+    // `FUnOp`), but needs `Ctx` (to resolve handles via `Ctx::unbox` and to
+    // record a pending error on the array ops), so it takes the `ctx` pointer
+    // `jit_ftrans` doesn't.
+    let mut bosig = module.make_signature();
+    bosig.params.push(AbiParam::new(ptr));
+    bosig.params.push(AbiParam::new(types::I64));
+    bosig.params.push(AbiParam::new(types::I64));
+    bosig.params.push(AbiParam::new(types::I64));
+    bosig.params.push(AbiParam::new(types::I64));
+    bosig.returns.push(AbiParam::new(types::I64));
+    let boxed_op_id = module
+        .declare_function("jit_boxed_op", Linkage::Import, &bosig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported non-tail-call depth guard (issue #271): `jit_enter_call`
+    // (ctx) -> bool-as-i64 (nonzero = ok, depth bumped; zero = at the cap, a
+    // recursion-limit error is now pending) and `jit_exit_call` (ctx) -> (),
+    // its counterpart. Wraps every non-tail `Call` (`emit_call`) so the
+    // direct native-to-native `call_indirect` fast path — which never
+    // otherwise reaches `Ctx::call` — is guarded too, not just calls that
+    // fall through to the host trampoline.
+    let mut esig = module.make_signature();
+    esig.params.push(AbiParam::new(ptr));
+    esig.returns.push(AbiParam::new(types::I64));
+    let enter_call_id = module
+        .declare_function("jit_enter_call", Linkage::Import, &esig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    let mut xsig = module.make_signature();
+    xsig.params.push(AbiParam::new(ptr));
+    let exit_call_id = module
+        .declare_function("jit_exit_call", Linkage::Import, &xsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Imported FOR zero-step error reporter: (ctx) -> (). Called from the
+    // zero-step arm of a `Core::For` loop to record the tree-walker's own
+    // "for step must be non-zero" error on `Ctx`; the native code skips the
+    // loop entirely (matching `special_forms.rs::eval_for`).
+    let mut fzsig = module.make_signature();
+    fzsig.params.push(AbiParam::new(ptr));
+    let for_step_zero_id = module
+        .declare_function("jit_for_step_zero", Linkage::Import, &fzsig)
+        .map_err(|e| format!("{e:?}"))?;
+
+    // The function we are building: (args*, ctx*) -> u64.
+    let mut ctx_codegen = module.make_context();
+    ctx_codegen.func.signature.params.push(AbiParam::new(ptr));
+    ctx_codegen.func.signature.params.push(AbiParam::new(ptr));
+    ctx_codegen
+        .func
+        .signature
+        .returns
+        .push(AbiParam::new(types::I64));
+
+    let mut fbctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx_codegen.func, &mut fbctx);
+        let tramp_ref = module.declare_func_in_func(tramp_id, b.func);
+        let pending_tail_ref = module.declare_func_in_func(pending_tail_id, b.func);
+        let resolve_pending_ref = module.declare_func_in_func(resolve_pending_id, b.func);
+        let alloc_ref = module.declare_func_in_func(alloc_id, b.func);
+        let alloc_stride_ref = module.declare_func_in_func(alloc_stride_id, b.func);
+        let array_oob_ref = module.declare_func_in_func(array_oob_id, b.func);
+        let bad_char_ref = module.declare_func_in_func(bad_char_id, b.func);
+        let ftrans_ref = module.declare_func_in_func(ftrans_id, b.func);
+        let ftrans2_ref = module.declare_func_in_func(ftrans2_id, b.func);
+        let boxed_op_ref = module.declare_func_in_func(boxed_op_id, b.func);
+        let enter_call_ref = module.declare_func_in_func(enter_call_id, b.func);
+        let exit_call_ref = module.declare_func_in_func(exit_call_id, b.func);
+        let for_step_zero_ref = module.declare_func_in_func(for_step_zero_id, b.func);
+        let callee_sig = b.import_signature(callee_sig);
+
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let args_ptr = b.block_params(entry)[0];
+        let ctx_ptr = b.block_params(entry)[1];
+
+        // Local variables (params + let bindings + loop counters), lowered to
+        // cranelift-frontend SSA Variables. Every slot is a u64 word (floats
+        // bit-cast), so every Variable is I64. Declaring `n_slots` up front;
+        // slots never read before being written (let/for temporaries) simply
+        // never materialize. The incoming argument words are `def_var`ed here
+        // in the entry block, the first predecessor of the loop header.
+        let vars: Vec<Variable> = (0..n_slots).map(|_| b.declare_var(types::I64)).collect();
+        for (i, var) in vars.iter().enumerate().take(n_params) {
+            let v = b.ins().load(
+                types::I64,
+                MemFlagsData::trusted(),
+                args_ptr,
+                (i * 8) as i32,
+            );
+            b.def_var(*var, v);
+        }
+
+        // Loop header for self tail calls (issue #133 Tier 1): the prologue
+        // falls through to it once; a self tail call elsewhere in the body
+        // `def_var`s its new argument values and jumps back here instead of
+        // recursing. Because the parameter Variables are redefined on that
+        // back edge, cranelift-frontend inserts the necessary block
+        // parameters at this header automatically when it is sealed — so the
+        // header must NOT be sealed until the whole body is emitted (every
+        // back-edge predecessor must be known first).
+        let header = b.create_block();
+        // Issue #212: arena length at entry, defined in the entry block so it
+        // dominates every back edge. Only emitted for an all-scalar function
+        // that calls itself (`reclaim`); the back edge frees back to it.
+        let arena_mark = if reclaim {
+            let mark_ref = module.declare_func_in_func(arena_mark_id, b.func);
+            let call = b.ins().call(mark_ref, &[ctx_ptr]);
+            Some(b.inst_results(call)[0])
+        } else {
+            None
+        };
+        let arena_reclaim_ref = module.declare_func_in_func(arena_reclaim_id, b.func);
+        b.ins().jump(header, &[]);
+        b.switch_to_block(header);
+
+        let mut e = Emitter {
+            b: &mut b,
+            ptr,
+            vars,
+            ctx_ptr,
+            tramp_ref,
+            pending_tail_ref,
+            resolve_pending_ref,
+            alloc_ref,
+            alloc_stride_ref,
+            array_oob_ref,
+            bad_char_ref,
+            ftrans_ref,
+            ftrans2_ref,
+            boxed_op_ref,
+            enter_call_ref,
+            exit_call_ref,
+            for_step_zero_ref,
+            callee_sig,
+            cell_addrs,
+            param_counts,
+            self_id,
+            header,
+            arena_mark,
+            arena_reclaim_ref,
+        };
+        match e.emit(core, true) {
+            Emitted::Value(result) => {
+                b.ins().return_(&[result]);
+            }
+            Emitted::TailLooped => {
+                // The whole body is an unconditional self tail call with no
+                // reachable base case (e.g. `(defun-typed (f int64) () (f))`)
+                // — every path already jumped back to `header`; there is no
+                // value to return from here. A user-level infinite loop, not
+                // a compiler error.
+            }
+        }
+        b.seal_block(header);
+        b.finalize();
+    }
+
+    let func_id = module
+        .declare_function("typed_fn", Linkage::Export, &ctx_codegen.func.signature)
+        .map_err(|e| format!("{e:?}"))?;
+    module
+        .define_function(func_id, &mut ctx_codegen)
+        .map_err(|e| format!("{e:?}"))?;
+    module.clear_context(&mut ctx_codegen);
+    module
+        .finalize_definitions()
+        .map_err(|e| format!("{e:?}"))?;
+
+    let code = module.get_finalized_function(func_id);
+    let entry = unsafe { std::mem::transmute::<*const u8, NativeEntry>(code) };
+    Ok(NativeEdition {
+        entry,
+        _module: module,
+    })
+}
+
+struct Emitter<'a, 'b, 'c> {
+    b: &'a mut FunctionBuilder<'b>,
+    ptr: types::Type,
+    /// SSA Variables for the local slot frame (params + `let` bindings + `for`
+    /// counters), indexed by Core slot number. All `types::I64`; floats travel
+    /// as bit-cast words. Reads are `use_var`, writes `def_var` — no stack
+    /// round-trip, so loop-carried state stays in registers.
+    vars: Vec<Variable>,
+    ctx_ptr: Value,
+    tramp_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`jit_resolve_pending_tail`]: drains a pending cross-function
+    /// tail call left by a direct native callee, so the deferred result can
+    /// never replace this function's own return value.
+    resolve_pending_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`jit_set_pending_tail`] (issue #133 Tier 2a): records a
+    /// cross-function tail call on `Ctx` instead of performing it natively.
+    pending_tail_ref: cranelift_codegen::ir::FuncRef,
+    alloc_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_alloc_stride`] (jit/core-loops array-of-structs
+    /// follow-up): the inline (contiguous array-of-structs) allocator,
+    /// called from the `Core::ArrayNewStride` arm.
+    alloc_stride_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_array_oob`] (issue #282): records the evaluator's
+    /// index error on `Ctx` from the out-of-bounds arm of a guarded
+    /// `FETCH`/`STORE`.
+    array_oob_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_bad_char`] (issue #281): records the CODE-CHAR
+    /// range error on `Ctx` from the out-of-range arm of a CODE-CHAR narrowing.
+    bad_char_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_ftrans`]: the libm float-intrinsic trampoline
+    /// (`sin`/`cos`/`tan`/`exp`/`round`), called from the `FUnary` arm.
+    ftrans_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_ftrans2`] (#398): the binary libm trampoline
+    /// (`expt`), called from the `FBinary` arm.
+    ftrans2_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_boxed_op`] (issue #476 phase 3b/3c): the boxed-
+    /// handle intrinsic trampoline (`equal`/`hash-code`/general-array
+    /// access), called from the `Core::BoxedOp` arm.
+    boxed_op_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_enter_call`]/[`super::jit_exit_call`] (issue
+    /// #271): the non-tail call depth guard `emit_call` wraps every call in.
+    enter_call_ref: cranelift_codegen::ir::FuncRef,
+    exit_call_ref: cranelift_codegen::ir::FuncRef,
+    /// Imported [`super::jit_for_step_zero`]: records the tree-walker's "for
+    /// step must be non-zero" error on `Ctx` from the zero-step arm of a
+    /// `Core::For` loop.
+    for_step_zero_ref: cranelift_codegen::ir::FuncRef,
+    callee_sig: SigRef,
+    cell_addrs: &'c [usize],
+    /// Expected parameter count for each callee, parallel to `cell_addrs`.
+    /// Used in `emit_call` to detect call-site/callee arity mismatches at
+    /// native-compile time (arising from redefinitions that changed arity after
+    /// callers were elaborated but before they were recompiled).
+    param_counts: &'c [usize],
+    /// This function's own registry id — a `Call(id, ..)` reached in tail
+    /// position with `id == self_id` is a self tail call (issue #133 Tier 1).
+    self_id: usize,
+    /// The loop header block a self tail call jumps back to, after `def_var`ing
+    /// its new argument values. Not sealed until the whole body has been
+    /// emitted (every back-edge must be known first, so cranelift-frontend can
+    /// insert the loop-carried parameter block params).
+    header: cranelift_codegen::ir::Block,
+    /// Issue #212: the arena length captured at function entry, present only
+    /// when this all-scalar function calls itself. A self tail call frees
+    /// back to it via [`jit_arena_reclaim`](super::jit_arena_reclaim).
+    arena_mark: Option<Value>,
+    arena_reclaim_ref: cranelift_codegen::ir::FuncRef,
+}
+
+/// Outcome of emitting one [`Core`] node. Mirrors [`crate::jit::runtime::TailStep`]
+/// for the native backend: a self tail call terminates its current block
+/// with a jump to the loop header instead of producing a value, so callers
+/// in a tail-propagating position must check for this and skip any further
+/// store/jump they would otherwise add to that (now-terminated) block.
+enum Emitted {
+    Value(Value),
+    TailLooped,
+}
+
+impl Emitter<'_, '_, '_> {
+    fn iconst(&mut self, n: i64) -> Value {
+        self.b.ins().iconst(types::I64, n)
+    }
+
+    /// `word != 0` as an I8 predicate.
+    fn truthy(&mut self, w: Value) -> Value {
+        let z = self.iconst(0);
+        self.b.ins().icmp(IntCC::NotEqual, w, z)
+    }
+
+    /// Emit `core` in a definitely-non-tail context: always produces a
+    /// value (a self tail call can only arise from a tail-position `emit`
+    /// call, never from here).
+    fn emit_value(&mut self, core: &Core) -> Value {
+        match self.emit(core, false) {
+            Emitted::Value(v) => v,
+            Emitted::TailLooped => unreachable!("non-tail context cannot tail-loop"),
+        }
+    }
+
+    /// Emit `core`, which is in tail position of the function body iff
+    /// `tail` is set. Tail status only propagates through the constructs
+    /// whose value is *exactly* their tail sub-node's value with no further
+    /// transformation (`if`/`let`/`and`/`or`/`seq`); everything else is
+    /// evaluated via [`Self::emit_value`] and wrapped as an already-produced
+    /// value.
+    fn emit(&mut self, core: &Core, tail: bool) -> Emitted {
+        match core {
+            Core::LitI(n) => Emitted::Value(self.iconst(*n)),
+            Core::LitF(f) => Emitted::Value(self.iconst(f.to_bits() as i64)),
+            Core::Var(i) => Emitted::Value(self.b.use_var(self.vars[*i])),
+            Core::Bin(k, op, a, b) => {
+                let (x, y) = (self.emit_value(a), self.emit_value(b));
+                Emitted::Value(match k {
+                    NumKind::I => self.int_bin(*op, x, y),
+                    NumKind::F => self.float_bin(*op, x, y),
+                })
+            }
+            Core::Cmp(k, op, a, b) => {
+                let (x, y) = (self.emit_value(a), self.emit_value(b));
+                let cmp = match k {
+                    NumKind::I => self.b.ins().icmp(int_cc(*op), x, y),
+                    NumKind::F => {
+                        let (xf, yf) = (self.as_f(x), self.as_f(y));
+                        self.b.ins().fcmp(float_cc(*op), xf, yf)
+                    }
+                };
+                Emitted::Value(self.b.ins().uextend(types::I64, cmp))
+            }
+            Core::Not(a) => {
+                let v = self.emit_value(a);
+                let z = self.iconst(0);
+                let c = self.b.ins().icmp(IntCC::Equal, v, z);
+                Emitted::Value(self.b.ins().uextend(types::I64, c))
+            }
+            Core::And(a, b) => {
+                // a ? (b != 0) : 0  — short-circuits. `b` is bool-typed (the
+                // elaborator requires it), so truthy-normalizing it is the
+                // identity on any value that isn't itself a tail-loop.
+                let av = self.emit_value(a);
+                let cond = self.truthy(av);
+                self.branch_merge(
+                    cond,
+                    |s| s.emit_truthy(b, tail),
+                    |s| Emitted::Value(s.iconst(0)),
+                )
+            }
+            Core::Or(a, b) => {
+                // a ? 1 : (b != 0)  — short-circuits.
+                let av = self.emit_value(a);
+                let cond = self.truthy(av);
+                self.branch_merge(
+                    cond,
+                    |s| Emitted::Value(s.iconst(1)),
+                    |s| s.emit_truthy(b, tail),
+                )
+            }
+            Core::If(c, t, e) => {
+                let cv = self.emit_value(c);
+                let cond = self.truthy(cv);
+                self.branch_merge(cond, |s| s.emit(t, tail), |s| s.emit(e, tail))
+            }
+            Core::Let(slot, init, body) => {
+                let v = match self.try_stack_alloc(*slot, init, body) {
+                    Some(v) => v,
+                    None => self.emit_value(init),
+                };
+                self.b.def_var(self.vars[*slot], v);
+                self.emit(body, tail)
+            }
+            Core::Call(id, args) if tail && *id == self.self_id => self.emit_self_tail_call(args),
+            Core::Call(id, args) if tail => Emitted::Value(self.emit_cross_tail_call(*id, args)),
+            Core::Call(id, args) => Emitted::Value(self.emit_call(*id, args)),
+            Core::ToChar(a) => {
+                // Narrow int64 -> char by masking to a byte (issue #136). An
+                // argument outside 0..=255 is not representable as the typed
+                // island's byte-`char`: record the evaluator's CODE-CHAR range
+                // error (issue #281) via the host trampoline, then still yield
+                // the masked byte as the memory-safe substitute. Only the
+                // out-of-range arm calls the trampoline; the in-range hot path
+                // is the same single `band` as before.
+                let v = self.emit_value(a);
+                let masked = self.b.ins().band_imm(v, 0xff);
+                let zero = self.iconst(0);
+                let max = self.iconst(255);
+                let ge0 = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, v, zero);
+                let le255 = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, v, max);
+                let in_range = self.b.ins().band(ge0, le255);
+                Emitted::Value(self.branch_to_slot(
+                    in_range,
+                    |_s| masked,
+                    |s| {
+                        s.b.ins().call(s.bad_char_ref, &[s.ctx_ptr, v]);
+                        masked
+                    },
+                ))
+            }
+            Core::FUnary(op, a) => {
+                use super::types::FUnOp;
+                // Unary float intrinsic: bitcast the arg word to f64, apply the
+                // op, and produce the result word. `sqrt` yields a float word;
+                // the rounding ops floor/ceil/trunc convert to int64 with a
+                // *saturating* fcvt, matching Rust's saturating `f64 as i64` that
+                // the evaluator and Core interpreter use. The libm ops
+                // (sin/cos/tan/exp/round — no direct instruction) call the
+                // `jit_ftrans` trampoline, which returns the result word already
+                // (float bits or the integer), computed by `FUnOp::apply_word`.
+                let v = self.emit_value(a);
+                let af = self.as_f(v);
+                let r = if op.is_libm() {
+                    let opc = self.iconst(op.opcode() as i64);
+                    let call = self.b.ins().call(self.ftrans_ref, &[opc, af]);
+                    self.b.inst_results(call)[0]
+                } else {
+                    match op {
+                        FUnOp::Sqrt => {
+                            let rf = self.b.ins().sqrt(af);
+                            self.as_i(rf)
+                        }
+                        FUnOp::Floor => {
+                            let rf = self.b.ins().floor(af);
+                            self.b.ins().fcvt_to_sint_sat(types::I64, rf)
+                        }
+                        FUnOp::Ceil => {
+                            let rf = self.b.ins().ceil(af);
+                            self.b.ins().fcvt_to_sint_sat(types::I64, rf)
+                        }
+                        FUnOp::Trunc => {
+                            let rf = self.b.ins().trunc(af);
+                            self.b.ins().fcvt_to_sint_sat(types::I64, rf)
+                        }
+                        _ => unreachable!("libm ops routed through jit_ftrans above"),
+                    }
+                };
+                Emitted::Value(r)
+            }
+            Core::FBinary(op, a, b) => {
+                // Binary float intrinsic: both operands already are raw
+                // words; the trampoline returns the result's float bits.
+                let x = self.emit_value(a);
+                let y = self.emit_value(b);
+                let opc = self.iconst(op.opcode() as i64);
+                let call = self.b.ins().call(self.ftrans2_ref, &[opc, x, y]);
+                Emitted::Value(self.b.inst_results(call)[0])
+            }
+            Core::IntToFloat(a) => {
+                // `(float int)`: widen an int64 word to a float64 word.
+                let v = self.emit_value(a);
+                let f = self.b.ins().fcvt_from_sint(types::F64, v);
+                Emitted::Value(self.as_i(f))
+            }
+            Core::ArrayNew(n) => {
+                let n = self.emit_value(n);
+                // Pass the signed length through unchanged: `jit_alloc`
+                // routes it to `Ctx::alloc_buffer_signed`, which records the
+                // evaluator's "non-negative integer" error for a negative
+                // size (issue #271) instead of silently clamping to 0.
+                Emitted::Value(self.alloc(n))
+            }
+            Core::ArrayGet(a, i) => {
+                let base = self.emit_value(a);
+                let idx = self.emit_value(i);
+                let in_range = self.in_bounds(base, idx);
+                Emitted::Value(self.branch_to_slot(
+                    in_range,
+                    |s| {
+                        let addr = s.elem_addr(base, idx);
+                        s.b.ins().load(types::I64, MemFlagsData::trusted(), addr, 0)
+                    },
+                    |s| {
+                        // Out of bounds: record the evaluator's index error
+                        // (issue #282), then substitute 0 as before.
+                        s.record_oob(base, idx, false);
+                        s.iconst(0)
+                    },
+                ))
+            }
+            Core::ArraySet(a, i, v) => {
+                let base = self.emit_value(a);
+                let idx = self.emit_value(i);
+                let val = self.emit_value(v);
+                let in_range = self.in_bounds(base, idx);
+                Emitted::Value(self.branch_to_slot(
+                    in_range,
+                    |s| {
+                        let addr = s.elem_addr(base, idx);
+                        s.b.ins().store(MemFlagsData::trusted(), val, addr, 0);
+                        val
+                    },
+                    |s| {
+                        // Out of bounds: record the evaluator's index error
+                        // (issue #282); the store is a no-op, return `val` as
+                        // before (the recorded error supersedes the result).
+                        s.record_oob(base, idx, true);
+                        val
+                    },
+                ))
+            }
+            Core::ArrayLen(a) => {
+                let base = self.emit_value(a);
+                Emitted::Value(
+                    self.b
+                        .ins()
+                        .load(types::I64, MemFlagsData::trusted(), base, 0),
+                )
+            }
+            Core::ArrayMap2(op, kind, out, a, b) => {
+                let base_out = self.emit_value(out);
+                let base_a = self.emit_value(a);
+                let base_b = self.emit_value(b);
+                Emitted::Value(self.emit_array_map2(*op, *kind, base_out, base_a, base_b))
+            }
+            Core::ArrayOp(op, kind, xs) => {
+                // Operands left to right, `out` first (#525).
+                let vals: Vec<Value> = xs.iter().map(|x| self.emit_value(x)).collect();
+                Emitted::Value(self.emit_array_op(*op, *kind, &vals))
+            }
+            Core::ArraySum(k, a) => {
+                let base_a = self.emit_value(a);
+                Emitted::Value(self.emit_array_reduce(*k, base_a, None))
+            }
+            Core::ArrayDot(k, a, b) => {
+                let base_a = self.emit_value(a);
+                let base_b = self.emit_value(b);
+                Emitted::Value(self.emit_array_reduce(*k, base_a, Some(base_b)))
+            }
+            Core::ArrayNewStride(n, stride) => {
+                let n = self.emit_value(n);
+                Emitted::Value(self.alloc_stride(n, *stride))
+            }
+            Core::InlineFieldGet(a, i, field, stride) => {
+                let base = self.emit_value(a);
+                let idx = self.emit_value(i);
+                let in_range = self.in_bounds(base, idx);
+                Emitted::Value(self.branch_to_slot(
+                    in_range,
+                    |s| {
+                        let addr = s.inline_field_addr(base, idx, *stride, *field);
+                        s.b.ins().load(types::I64, MemFlagsData::trusted(), addr, 0)
+                    },
+                    |s| {
+                        // Out of bounds: record the evaluator's index error
+                        // (issue #282), then substitute 0, matching `ArrayGet`.
+                        s.record_oob(base, idx, false);
+                        s.iconst(0)
+                    },
+                ))
+            }
+            Core::InlineFieldSet(a, i, field, stride, v) => {
+                let base = self.emit_value(a);
+                let idx = self.emit_value(i);
+                let val = self.emit_value(v);
+                let in_range = self.in_bounds(base, idx);
+                Emitted::Value(self.branch_to_slot(
+                    in_range,
+                    |s| {
+                        let addr = s.inline_field_addr(base, idx, *stride, *field);
+                        s.b.ins().store(MemFlagsData::trusted(), val, addr, 0);
+                        val
+                    },
+                    |s| {
+                        // Out of bounds: record the index error; the store is
+                        // a no-op, return `val` as before, matching `ArraySet`.
+                        s.record_oob(base, idx, true);
+                        val
+                    },
+                ))
+            }
+            Core::ArraySetStride(a, i, stride, fields) => {
+                let base = self.emit_value(a);
+                let idx = self.emit_value(i);
+                let vals: Vec<Value> = fields.iter().map(|f| self.emit_value(f)).collect();
+                let in_range = self.in_bounds(base, idx);
+                Emitted::Value(self.branch_to_slot(
+                    in_range,
+                    |s| {
+                        for (k, v) in vals.iter().enumerate() {
+                            let addr = s.inline_field_addr(base, idx, *stride, k);
+                            s.b.ins().store(MemFlagsData::trusted(), *v, addr, 0);
+                        }
+                        s.iconst(0)
+                    },
+                    |s| {
+                        // Out of bounds: record the index error; every field
+                        // store is skipped, matching `ArraySet`'s no-op.
+                        s.record_oob(base, idx, true);
+                        s.iconst(0)
+                    },
+                ))
+            }
+            Core::StructNew(inits) => {
+                let vals: Vec<Value> = inits.iter().map(|c| self.emit_value(c)).collect();
+                let n = self.iconst(vals.len() as i64);
+                let base = self.alloc(n);
+                for (i, v) in vals.iter().enumerate() {
+                    self.b
+                        .ins()
+                        .store(MemFlagsData::trusted(), *v, base, ((i + 1) * 8) as i32);
+                }
+                Emitted::Value(base)
+            }
+            Core::FieldGet(s, idx) => {
+                let base = self.emit_value(s);
+                Emitted::Value(self.b.ins().load(
+                    types::I64,
+                    MemFlagsData::trusted(),
+                    base,
+                    ((*idx + 1) * 8) as i32,
+                ))
+            }
+            Core::FieldSet(s, idx, v) => {
+                let base = self.emit_value(s);
+                let val = self.emit_value(v);
+                self.b
+                    .ins()
+                    .store(MemFlagsData::trusted(), val, base, ((*idx + 1) * 8) as i32);
+                Emitted::Value(val)
+            }
+            Core::Seq(forms) => match forms.split_last() {
+                Some((last, init)) => {
+                    for f in init {
+                        self.emit_value(f);
+                    }
+                    self.emit(last, tail)
+                }
+                None => Emitted::Value(self.iconst(0)),
+            },
+            Core::Assign(slot, val) => {
+                let v = self.emit_value(val);
+                self.b.def_var(self.vars[*slot], v);
+                Emitted::Value(v)
+            }
+            Core::While(test, body) => Emitted::Value(self.emit_while(test, body)),
+            Core::For {
+                slot,
+                start,
+                end,
+                step,
+                body,
+            } => Emitted::Value(self.emit_for(*slot, start, end, step, body)),
+            Core::BoxedOp(op, args) => {
+                // Boxed-handle intrinsic (issue #476 phase 3b/3c): evaluate
+                // every arg (unused positions are simply not present), pad to
+                // three with a zero placeholder (ignored by `jit_boxed_op`'s
+                // callee per `BoxedOp`'s own doc comment on which args each
+                // op reads), and dispatch through the single opcode-tagged
+                // trampoline — mirrors `FUnary`'s libm-call shape but threads
+                // `ctx_ptr` too, since resolving a handle needs `Ctx`.
+                let mut vals: Vec<Value> = args.iter().map(|a| self.emit_value(a)).collect();
+                let zero = self.iconst(0);
+                while vals.len() < 3 {
+                    vals.push(zero);
+                }
+                let opc = self.iconst(op.opcode() as i64);
+                let call = self.b.ins().call(
+                    self.boxed_op_ref,
+                    &[self.ctx_ptr, opc, vals[0], vals[1], vals[2]],
+                );
+                Emitted::Value(self.b.inst_results(call)[0])
+            }
+        }
+    }
+
+    /// Lower [`Core::While`]: a header/body/exit block triple, re-testing
+    /// TEST at the top of every iteration. `header` has two predecessors (the
+    /// initial fall-through and the body's back edge) so it is sealed only
+    /// once both are known, exactly mirroring the discipline `compile_native`
+    /// uses for the self-tail-call loop header. Always yields `0` — `false`,
+    /// i.e. NIL, at the elaborated type `bool` (#524).
+    fn emit_while(&mut self, test: &Core, body: &Core) -> Value {
+        let header = self.b.create_block();
+        let body_b = self.b.create_block();
+        let exit_b = self.b.create_block();
+
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(header);
+        // Not sealed yet: the back edge from `body_b` is the second
+        // predecessor and hasn't been emitted yet.
+        let cond = self.emit_value(test);
+        let condb = self.truthy(cond);
+        self.b.ins().brif(condb, body_b, &[], exit_b, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b); // single predecessor: header's brif
+        self.emit_value(body);
+        self.b.ins().jump(header, &[]);
+        self.b.seal_block(header); // both predecessors known now
+
+        self.b.switch_to_block(exit_b);
+        self.b.seal_block(exit_b); // single predecessor: header's brif
+        self.iconst(0)
+    }
+
+    /// Lower [`Core::For`]: evaluate START/END/STEP once, check STEP != 0
+    /// (recording the tree-walker's "for step must be non-zero" error via the
+    /// [`super::jit_for_step_zero`] trampoline and skipping the loop
+    /// otherwise), then iterate the counter — held in the SSA Variable for
+    /// `slot` so nested `Var(slot)` reads inside `body` see each value — from START
+    /// to END inclusive by STEP, direction by STEP's sign. The increment is
+    /// overflow-checked (`sadd_overflow`, mirroring `int_bin`'s `Add`) but,
+    /// unlike ordinary `+`, an overflow here silently breaks the loop instead
+    /// of setting the `OVERFLOW` flag — matching the tree-walker's
+    /// `checked_add` guard (`special_forms.rs::eval_for`). Always yields `0`.
+    fn emit_for(
+        &mut self,
+        slot: usize,
+        start: &Core,
+        end: &Core,
+        step: &Core,
+        body: &Core,
+    ) -> Value {
+        let s = self.emit_value(start);
+        let e = self.emit_value(end);
+        let st = self.emit_value(step);
+
+        let zero = self.iconst(0);
+        let is_zero = self.b.ins().icmp(IntCC::Equal, st, zero);
+        let ok_b = self.b.create_block();
+        let skip_b = self.b.create_block();
+        let done_b = self.b.create_block();
+        self.b.ins().brif(is_zero, skip_b, &[], ok_b, &[]);
+
+        self.b.switch_to_block(skip_b);
+        self.b.seal_block(skip_b); // single predecessor: the is_zero brif
+        self.b.ins().call(self.for_step_zero_ref, &[self.ctx_ptr]);
+        self.b.ins().jump(done_b, &[]);
+
+        self.b.switch_to_block(ok_b);
+        self.b.seal_block(ok_b); // single predecessor: the is_zero brif
+        self.b.def_var(self.vars[slot], s);
+
+        let header = self.b.create_block();
+        let body_b = self.b.create_block();
+        let after_b = self.b.create_block();
+        self.b.ins().jump(header, &[]);
+
+        self.b.switch_to_block(header);
+        // Not sealed yet: `body_b`'s no-overflow back edge is the second
+        // predecessor and hasn't been emitted yet.
+        let i_val = self.b.use_var(self.vars[slot]);
+        // Inclusive bound; direction depends on the sign of step.
+        let cmp_asc = self.b.ins().icmp(IntCC::SignedLessThanOrEqual, i_val, e);
+        let cmp_desc = self.b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i_val, e);
+        let step_pos = self.b.ins().icmp(IntCC::SignedGreaterThan, st, zero);
+        let in_range = self.b.ins().select(step_pos, cmp_asc, cmp_desc);
+        self.b.ins().brif(in_range, body_b, &[], after_b, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b); // single predecessor: header's brif
+        self.emit_value(body);
+        let i_val2 = self.b.use_var(self.vars[slot]);
+        let (next, overflow) = self.b.ins().sadd_overflow(i_val2, st);
+        // Guard against overflow so a runaway step can't panic or silently
+        // wrap into an infinite loop — no OVERFLOW flag (unlike ordinary `+`).
+        let no_of_b = self.b.create_block();
+        self.b.ins().brif(overflow, after_b, &[], no_of_b, &[]);
+
+        self.b.switch_to_block(no_of_b);
+        self.b.seal_block(no_of_b); // single predecessor: body_b's brif
+        self.b.def_var(self.vars[slot], next);
+        self.b.ins().jump(header, &[]);
+        self.b.seal_block(header); // both predecessors known now
+
+        self.b.switch_to_block(after_b);
+        // Two predecessors — header's in-range-false arm and body_b's
+        // overflow arm — both known now.
+        self.b.seal_block(after_b);
+        self.b.ins().jump(done_b, &[]);
+
+        self.b.switch_to_block(done_b);
+        // Two predecessors — skip_b and after_b — both known now.
+        self.b.seal_block(done_b);
+        self.iconst(0)
+    }
+
+    /// Evaluate `core` and normalize to the boolean word `(value != 0)`,
+    /// tail-aware: if `core` tail-loops, there is no value to normalize —
+    /// propagate the tail-loop unchanged.
+    fn emit_truthy(&mut self, core: &Core, tail: bool) -> Emitted {
+        match self.emit(core, tail) {
+            Emitted::Value(v) => {
+                let t = self.truthy(v);
+                Emitted::Value(self.b.ins().uextend(types::I64, t))
+            }
+            Emitted::TailLooped => Emitted::TailLooped,
+        }
+    }
+
+    /// A self tail call in tail position (issue #133 Tier 1): evaluate every
+    /// new argument value in the *current* env — before any parameter slot
+    /// is overwritten, exactly mirroring `eval_core`'s parallel-assignment
+    /// ordering, since a new argument may read an old parameter a sibling
+    /// argument is about to clobber (`(sum (- n 1) (+ acc n))`) — `def_var`
+    /// them into the parameter Variables, then jump back to the loop header
+    /// instead of emitting a call. cranelift-frontend threads these
+    /// redefinitions into the header's block parameters when it is sealed.
+    /// This terminates the current block; the caller must not add further
+    /// instructions to it.
+    fn emit_self_tail_call(&mut self, args: &[Core]) -> Emitted {
+        let vals: Vec<Value> = args.iter().map(|a| self.emit_value(a)).collect();
+        if let Some(mark) = self.arena_mark {
+            // All new argument words are scalars (the function is
+            // all-scalar), so nothing rooted since entry stays reachable.
+            self.b
+                .ins()
+                .call(self.arena_reclaim_ref, &[self.ctx_ptr, mark]);
+        }
+        for (i, v) in vals.iter().enumerate() {
+            self.b.def_var(self.vars[i], *v);
+        }
+        self.b.ins().jump(self.header, &[]);
+        Emitted::TailLooped
+    }
+
+    /// A *cross*-function tail call in tail position (issue #133 Tier 2a):
+    /// evaluate the arguments, hand the target id and argument words to the
+    /// host via [`jit_set_pending_tail`], and produce a placeholder value.
+    /// Unlike [`Self::emit_self_tail_call`], this does *not* terminate the
+    /// current block with a jump — the function returns normally (its own
+    /// `return_`, emitted by the ordinary tail-value machinery this value
+    /// flows through), and `TypedFn::invoke`'s Rust-level dispatch loop picks
+    /// up the pending call from there. No calling-convention change, no
+    /// native-to-native jump: this is what keeps native stack usage O(1) for
+    /// mutual/general tail recursion without Cranelift's `tail` CC (see the
+    /// design note on [`jit_set_pending_tail`]).
+    fn emit_cross_tail_call(&mut self, id: usize, args: &[Core]) -> Value {
+        let vals: Vec<Value> = args.iter().map(|a| self.emit_value(a)).collect();
+        let argc = vals.len();
+        let buf = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (argc.max(1) * 8) as u32,
+            3,
+        ));
+        for (i, v) in vals.iter().enumerate() {
+            self.b.ins().stack_store(*v, buf, (i * 8) as i32);
+        }
+        let buf_addr = self.b.ins().stack_addr(self.ptr, buf, 0);
+        let id_v = self.iconst(id as i64);
+        let argc_v = self.iconst(argc as i64);
+        self.b.ins().call(
+            self.pending_tail_ref,
+            &[self.ctx_ptr, id_v, buf_addr, argc_v],
+        );
+        self.iconst(0)
+    }
+
+    /// Evaluate a two-way branch, tail-aware. Mirrors [`Self::branch_to_slot`]
+    /// (merge each branch's value through a single block parameter on
+    /// `merge_b`) but skips the jump for a branch that already terminated its
+    /// block via [`Self::emit_self_tail_call`]'s jump to the loop header. If
+    /// *both* branches tail-loop, the merge block is unreachable — report the
+    /// whole node as tail-looping too rather than switching to a block with no
+    /// predecessors. `merge_b` then keeps only its appended block parameter and
+    /// is never switched to, so it stays `BlockStatus::Empty` ("pristine" —
+    /// appending a block param does not change that status), which
+    /// `FunctionBuilder::finalize` explicitly exempts from the sealed/filled
+    /// check (verified against `cranelift-frontend`'s `finalize()`), so an
+    /// unused `merge_b` is sound to simply never visit.
+    fn branch_merge(
+        &mut self,
+        cond: Value,
+        then_f: impl FnOnce(&mut Self) -> Emitted,
+        else_f: impl FnOnce(&mut Self) -> Emitted,
+    ) -> Emitted {
+        let then_b = self.b.create_block();
+        let else_b = self.b.create_block();
+        let merge_b = self.b.create_block();
+        let merge_param = self.b.append_block_param(merge_b, types::I64);
+
+        self.b.ins().brif(cond, then_b, &[], else_b, &[]);
+
+        self.b.switch_to_block(then_b);
+        self.b.seal_block(then_b);
+        let tr = then_f(self);
+        if let Emitted::Value(v) = tr {
+            self.b.ins().jump(merge_b, &[BlockArg::from(v)]);
+        }
+        // else: then's terminal block already ended with a jump to `header`.
+
+        self.b.switch_to_block(else_b);
+        self.b.seal_block(else_b);
+        let er = else_f(self);
+        if let Emitted::Value(v) = er {
+            self.b.ins().jump(merge_b, &[BlockArg::from(v)]);
+        }
+
+        if matches!(tr, Emitted::TailLooped) && matches!(er, Emitted::TailLooped) {
+            return Emitted::TailLooped;
+        }
+
+        self.b.switch_to_block(merge_b);
+        self.b.seal_block(merge_b);
+        Emitted::Value(merge_param)
+    }
+
+    /// Call the host allocator for an `len`-element buffer; returns the header
+    /// pointer as an `I64` word.
+    fn alloc(&mut self, len: Value) -> Value {
+        let call = self.b.ins().call(self.alloc_ref, &[self.ctx_ptr, len]);
+        self.b.inst_results(call)[0]
+    }
+
+    /// Try to lower a `Core::Let(slot, init, body)` allocation directly onto
+    /// a Cranelift `StackSlot` instead of the arena (jit/core-loops
+    /// stack-allocation follow-up). Returns `Some(pointer word)` only when
+    /// `init` is a constant-size `Core::ArrayNew(Core::LitI(n))` (`n` within
+    /// `0..=MAX_STACK_ALLOC_ELEMENTS`) or a `Core::StructNew(fields)` (whose
+    /// size is always constant — its field count), AND `slot` provably does
+    /// not escape `body` per [`allocation_escapes`]. Otherwise returns `None`,
+    /// meaning: fall back to the ordinary `self.emit_value(init)` arena path
+    /// unchanged. This is purely an allocation-strategy choice — identical
+    /// buffer layout and contents either way — never a semantic one.
+    fn try_stack_alloc(&mut self, slot: usize, init: &Core, body: &Core) -> Option<Value> {
+        match init {
+            Core::ArrayNew(n) => {
+                let Core::LitI(n) = n.as_ref() else {
+                    return None;
+                };
+                if *n < 0 || *n > MAX_STACK_ALLOC_ELEMENTS {
+                    return None;
+                }
+                if allocation_escapes(body, slot) {
+                    return None;
+                }
+                Some(self.stack_alloc_buffer(*n, &[]))
+            }
+            Core::StructNew(fields) => {
+                if fields.len() as i64 > MAX_STACK_ALLOC_ELEMENTS {
+                    return None;
+                }
+                if allocation_escapes(body, slot) {
+                    return None;
+                }
+                // Evaluate the field values *before* claiming the stack slot
+                // (matches the arena `Core::StructNew` arm's own evaluation
+                // order: every field is computed left-to-right first, then
+                // written into the freshly allocated buffer).
+                let vals: Vec<Value> = fields.iter().map(|c| self.emit_value(c)).collect();
+                Some(self.stack_alloc_buffer(vals.len() as i64, &vals))
+            }
+            _ => None,
+        }
+    }
+
+    /// Allocate a `[len, e0, e1, …]`-layout buffer of `n` elements on this
+    /// call frame's Cranelift stack — the exact same header-prefixed `u64`
+    /// layout `Ctx::alloc_buffer` gives an arena buffer, so every consumer
+    /// (`ArrayGet`/`ArraySet`/`ArrayLen`/`FieldGet`/`FieldSet`, all of which
+    /// just `load`/`store` through the returned address) needs no
+    /// stack-vs-arena special-casing. `vals`, if non-empty, are stored into
+    /// elements `0..vals.len()` (the `StructNew` case, whose fields are
+    /// already computed); otherwise every element is zero-initialized (the
+    /// `ArrayNew` case, matching `Ctx::alloc_buffer`'s `vec![0u64; n + 1]`).
+    /// Returns the buffer's address as a plain word — exactly what
+    /// `self.alloc` returns for the arena path.
+    fn stack_alloc_buffer(&mut self, n: i64, vals: &[Value]) -> Value {
+        let bytes = ((n as u32) + 1) * 8;
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            bytes,
+            3,
+        ));
+        let len_val = self.iconst(n);
+        self.b.ins().stack_store(len_val, slot, 0);
+        if vals.is_empty() {
+            let zero = self.iconst(0);
+            for i in 0..n {
+                self.b.ins().stack_store(zero, slot, ((i + 1) * 8) as i32);
+            }
+        } else {
+            for (i, v) in vals.iter().enumerate() {
+                self.b.ins().stack_store(*v, slot, ((i + 1) * 8) as i32);
+            }
+        }
+        self.b.ins().stack_addr(self.ptr, slot, 0)
+    }
+
+    /// Call the host allocator for an inline (contiguous array-of-structs)
+    /// buffer of `n` elements, `stride` words each (jit/core-loops follow-
+    /// up, [`Core::ArrayNewStride`]); returns the header pointer as an `I64`
+    /// word.
+    fn alloc_stride(&mut self, n: Value, stride: usize) -> Value {
+        let stride_v = self.iconst(stride as i64);
+        let call = self
+            .b
+            .ins()
+            .call(self.alloc_stride_ref, &[self.ctx_ptr, n, stride_v]);
+        self.b.inst_results(call)[0]
+    }
+
+    /// Address of `field` of inline element `idx` in a `stride`-word-per-
+    /// element buffer (jit/core-loops follow-up): `base + 8*(1 + idx*stride
+    /// + field)`. Used by [`Core::InlineFieldGet`]/[`Core::InlineFieldSet`]/
+    /// [`Core::ArraySetStride`].
+    fn inline_field_addr(&mut self, base: Value, idx: Value, stride: usize, field: usize) -> Value {
+        let scaled = self.b.ins().imul_imm(idx, stride as i64);
+        let words = self.b.ins().iadd_imm(scaled, (1 + field) as i64);
+        let byte_off = self.b.ins().imul_imm(words, 8);
+        self.b.ins().iadd(base, byte_off)
+    }
+
+    /// Address of element `idx` in buffer `base`: `base + 8*(idx+1)`.
+    fn elem_addr(&mut self, base: Value, idx: Value) -> Value {
+        let off = self.b.ins().iadd_imm(idx, 1);
+        let byte_off = self.b.ins().imul_imm(off, 8);
+        self.b.ins().iadd(base, byte_off)
+    }
+
+    /// Record the evaluator's out-of-range index error (issue #282) from the
+    /// out-of-bounds arm of a guarded `FETCH`/`STORE` by calling the
+    /// [`super::jit_array_oob`] host trampoline with `idx` and the buffer's
+    /// length. The caller still emits the memory-safe substitute value.
+    fn record_oob(&mut self, base: Value, idx: Value, is_store: bool) {
+        let len = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), base, 0);
+        let is_store = self.iconst(is_store as i64);
+        self.b
+            .ins()
+            .call(self.array_oob_ref, &[self.ctx_ptr, idx, len, is_store]);
+    }
+
+    /// Predicate `0 <= idx < len(base)` for bounds-checked access.
+    fn in_bounds(&mut self, base: Value, idx: Value) -> Value {
+        let len = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), base, 0);
+        let zero = self.iconst(0);
+        let ge0 = self
+            .b
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, idx, zero);
+        let lt = self.b.ins().icmp(IntCC::SignedLessThan, idx, len);
+        self.b.ins().band(ge0, lt)
+    }
+
+    /// Set a flag byte in `Ctx` to 1 when `flag_i8` is true.
+    ///
+    /// Emitted as a *cold-branch* store, not a branchless read-modify-write:
+    /// the old `load|or|store` cost three memory ops on the same `Ctx` line
+    /// per wrapping-checkable arithmetic op — the dominant per-iteration tax
+    /// in hot integer loops once locals moved to SSA registers (#435). The
+    /// common no-overflow path now costs one predictable not-taken branch
+    /// and touches no memory; the OR-accumulate semantics are unchanged
+    /// (the flag only ever transitions 0 → 1).
+    fn set_ctx_flag(&mut self, offset: usize, flag_i8: Value) {
+        let cold = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.set_cold_block(cold);
+        self.b.ins().brif(flag_i8, cold, &[], cont, &[]);
+
+        self.b.switch_to_block(cold);
+        self.b.seal_block(cold);
+        let addr = self.b.ins().iadd_imm(self.ctx_ptr, offset as i64);
+        let one = self.b.ins().iconst(types::I8, 1);
+        self.b.ins().store(MemFlagsData::trusted(), one, addr, 0);
+        self.b.ins().jump(cont, &[]);
+
+        self.b.switch_to_block(cont);
+        self.b.seal_block(cont);
+    }
+
+    fn int_bin(&mut self, op: BinOp, x: Value, y: Value) -> Value {
+        use super::runtime::Ctx;
+        match op {
+            BinOp::Add => {
+                let (result, of) = self.b.ins().sadd_overflow(x, y);
+                self.set_ctx_flag(Ctx::OVERFLOW_OFFSET, of);
+                result
+            }
+            BinOp::Sub => {
+                let (result, of) = self.b.ins().ssub_overflow(x, y);
+                self.set_ctx_flag(Ctx::OVERFLOW_OFFSET, of);
+                result
+            }
+            BinOp::Mul => {
+                let (result, of) = self.b.ins().smul_overflow(x, y);
+                self.set_ctx_flag(Ctx::OVERFLOW_OFFSET, of);
+                result
+            }
+            BinOp::Div | BinOp::Mod | BinOp::Rem => {
+                let zero = self.iconst(0);
+                let one = self.iconst(1);
+                let neg_one = self.iconst(-1);
+                let i64_min = self.iconst(i64::MIN);
+                let is_zero = self.b.ins().icmp(IntCC::Equal, y, zero);
+                // overflow == (x == i64::MIN) && (y == -1)
+                let x_is_min = self.b.ins().icmp(IntCC::Equal, x, i64_min);
+                let y_is_neg1 = self.b.ins().icmp(IntCC::Equal, y, neg_one);
+                let is_overflow = self.b.ins().band(x_is_min, y_is_neg1);
+                let is_unsafe = self.b.ins().bor(is_zero, is_overflow);
+                // Set flags on Ctx. MOD does NOT flag MIN%-1: its Euclidean
+                // value is exactly 0, matching the evaluator's MOD (#280) —
+                // only DIV's MIN/-1 is a genuine wrapped result. REMAINDER
+                // does flag it (value 0), as the evaluator's REMAINDER does.
+                self.set_ctx_flag(Ctx::DIV_BY_ZERO_OFFSET, is_zero);
+                if matches!(op, BinOp::Div | BinOp::Rem) {
+                    self.set_ctx_flag(Ctx::OVERFLOW_OFFSET, is_overflow);
+                }
+                // Use safe_y=1 to avoid hardware trap
+                let safe_y = self.b.ins().select(is_unsafe, one, y);
+                let result = if matches!(op, BinOp::Div) {
+                    self.b.ins().sdiv(x, safe_y)
+                } else if matches!(op, BinOp::Rem) {
+                    // Truncated remainder (#522). In the unsafe cases srem
+                    // runs against safe_y = 1, so MIN rem -1 yields 0.
+                    self.b.ins().srem(x, safe_y)
+                } else {
+                    // Euclidean modulo (#280), matching Rust's rem_euclid
+                    // (and therefore the evaluator's MOD): the result is
+                    // always non-negative — when the truncated remainder is
+                    // negative, add |y|. Computed as r + y for positive y
+                    // and r - y for negative y, which stays in range even
+                    // for y == i64::MIN (r ∈ (MIN, 0) there, so r - MIN ≤
+                    // MAX). In the unsafe cases (y == 0 or MIN % -1) srem
+                    // runs against safe_y = 1, so r = 0 and no adjustment
+                    // fires.
+                    let r = self.b.ins().srem(x, safe_y);
+                    let r_neg = self.b.ins().icmp(IntCC::SignedLessThan, r, zero);
+                    let y_neg = self.b.ins().icmp(IntCC::SignedLessThan, y, zero);
+                    let r_plus_y = self.b.ins().iadd(r, y);
+                    let r_minus_y = self.b.ins().isub(r, y);
+                    let adjusted = self.b.ins().select(y_neg, r_minus_y, r_plus_y);
+                    self.b.ins().select(r_neg, adjusted, r)
+                };
+                // div-by-zero → 0; MIN/-1 → wrapping MIN for div, 0 for mod/rem
+                self.b.ins().select(is_zero, zero, result)
+            }
+            BinOp::BitAnd => self.b.ins().band(x, y),
+            BinOp::BitOr => self.b.ins().bor(x, y),
+            BinOp::BitXor => self.b.ins().bxor(x, y),
+            // `y` is a constant in 1..=63 (the elaborator only emits shifts for a
+            // literal in-range `ash`), so Cranelift's shift-amount masking never
+            // engages and this matches the evaluator's in-range `ash` exactly.
+            // OVERFLOW is set exactly when bits are lost: `(v >> y) != x` (#514).
+            BinOp::Shl => {
+                let v = self.b.ins().ishl(x, y);
+                let back = self.b.ins().sshr(v, y);
+                let lost = self.b.ins().icmp(IntCC::NotEqual, back, x);
+                self.set_ctx_flag(Ctx::OVERFLOW_OFFSET, lost);
+                v
+            }
+            BinOp::AShr => self.b.ins().sshr(x, y),
+        }
+    }
+
+    // The verifier accepts ONLY endianness flags on `bitcast` — `trusted()`
+    // (notrap|aligned) fails verification, which silently killed the native
+    // edition of every function whose Core touches an i64<->f64 word cast
+    // (all-float signatures ran CLOSURE forever while ints went NATIVE).
+    fn as_f(&mut self, w: Value) -> Value {
+        let little = MemFlagsData::new().with_endianness(cranelift_codegen::ir::Endianness::Little);
+        self.b.ins().bitcast(types::F64, little, w)
+    }
+    fn as_i(&mut self, f: Value) -> Value {
+        let little = MemFlagsData::new().with_endianness(cranelift_codegen::ir::Endianness::Little);
+        self.b.ins().bitcast(types::I64, little, f)
+    }
+
+    fn float_bin(&mut self, op: BinOp, x: Value, y: Value) -> Value {
+        let (xf, yf) = (self.as_f(x), self.as_f(y));
+        let rf = match op {
+            BinOp::Add => self.b.ins().fadd(xf, yf),
+            BinOp::Sub => self.b.ins().fsub(xf, yf),
+            BinOp::Mul => self.b.ins().fmul(xf, yf),
+            BinOp::Div => self.b.ins().fdiv(xf, yf),
+            // unreachable: float mod/remainder is rejected
+            BinOp::Mod | BinOp::Rem => self.b.ins().fdiv(xf, yf),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::AShr => {
+                unreachable!("bitwise/shift ops are int64-only")
+            }
+        };
+        self.as_i(rf)
+    }
+
+    /// Lower [`Core::ArrayMap2`]: `out[i] = a[i] OP b[i]` for `i` in
+    /// `0..min(len out, len a, len b)`, via [`Self::emit_elementwise`].
+    /// Returns `base_out` unchanged (the node's value is the mutated `out`
+    /// array).
+    fn emit_array_map2(
+        &mut self,
+        op: BinOp,
+        kind: NumKind,
+        base_out: Value,
+        base_a: Value,
+        base_b: Value,
+    ) -> Value {
+        self.emit_elementwise(kind, base_out, &[base_a, base_b], None, |s, x| {
+            s.lane_bin(op, kind, x[0], x[1])
+        })
+    }
+
+    /// Lower [`Core::ArrayOp`] (#394, #525): `array-div!`, `array-scale!`,
+    /// `array-fma!`, `array-neg!` over `min(len)` of the array operands, via
+    /// [`Self::emit_elementwise`]. `w` holds the operand words, `out` first
+    /// (the `Scale` scalar is a raw int64/float64 word). Each lane computes
+    /// exactly what `runtime.rs::array_op` computes per element: int64
+    /// wraps (`imul`/`iadd`/`ineg` are two's-complement), float64 `fdiv`/
+    /// `fmul` round as Rust's `/`/`*` do, `fneg` flips the sign bit as unary
+    /// `-` does, and `array-fma!` is the
+    /// fused `fma` (one rounding, as `f64::mul_add`) — Cranelift emits
+    /// `vfmadd`/NEON `fmla` where the host has it and a per-lane `fma`
+    /// libcall otherwise, both correctly rounded, so every tier agrees
+    /// bit-for-bit. Returns `w[0]`.
+    fn emit_array_op(&mut self, op: ArrOp, kind: NumKind, w: &[Value]) -> Value {
+        let (arrays, scalar) = match op {
+            ArrOp::Scale => (&w[1..2], Some(w[2])),
+            _ => (&w[1..op.arity()], None),
+        };
+        self.emit_elementwise(kind, w[0], arrays, scalar, |s, x| {
+            let ins = s.b.ins();
+            match (op, kind) {
+                (ArrOp::Div, NumKind::F) => ins.fdiv(x[0], x[1]),
+                (ArrOp::Div, NumKind::I) => unreachable!("array-div! is float64-only"),
+                (ArrOp::Scale, NumKind::I) => ins.imul(x[0], x[1]),
+                (ArrOp::Scale, NumKind::F) => ins.fmul(x[0], x[1]),
+                (ArrOp::Fma, NumKind::I) => {
+                    let p = ins.imul(x[0], x[1]);
+                    s.b.ins().iadd(p, x[2])
+                }
+                (ArrOp::Fma, NumKind::F) => ins.fma(x[0], x[1], x[2]),
+                (ArrOp::Neg, NumKind::I) => ins.ineg(x[0]),
+                (ArrOp::Neg, NumKind::F) => ins.fneg(x[0]),
+            }
+        })
+    }
+
+    /// The shared elementwise loop behind [`Self::emit_array_map2`] and
+    /// [`Self::emit_array_op`]: `out[i] = lane(arrays[0][i], …, scalar)` for
+    /// `i` in `0..min_len`, `min_len` the minimum of `out`'s and every
+    /// `arrays` length, as a 2-lane SIMD loop (`I64X2`/`F64X2` — SSE on
+    /// x86-64, NEON on aarch64) with a scalar tail for a final odd element.
+    /// `lane` is called once with vector operands (the body) and once with
+    /// scalar `I64`/`F64` operands (the tail), so it must use only
+    /// lane-polymorphic instructions; `scalar` (a raw int64/float64 word) is
+    /// appended as the last operand, splatted for the body. Each element
+    /// depends only on its own index, so `out` may alias an input. Returns
+    /// `base_out`.
+    ///
+    /// Buffer layout: `[len, e0, e1, …]`, element `i` at `base + 8*(i+1)`
+    /// (`elem_addr`) — elements `i, i+1` are 16 contiguous bytes, so one
+    /// vector load/store per iteration covers both lanes. The buffer is
+    /// only 8-byte aligned (allocated as a `u64` buffer), so every vector
+    /// access uses **unaligned**, `notrap` `MemFlagsData` — the addresses are
+    /// always in-bounds by construction (`i < vec_end <= min_len`), so
+    /// `notrap` is sound, but `aligned` would be a lie for an odd `i`.
+    fn emit_elementwise(
+        &mut self,
+        kind: NumKind,
+        base_out: Value,
+        arrays: &[Value],
+        scalar: Option<Value>,
+        lane: impl Fn(&mut Self, &[Value]) -> Value,
+    ) -> Value {
+        let trusted = MemFlagsData::trusted();
+        let unaligned = MemFlagsData::new().with_notrap();
+        let (sty, vty) = match kind {
+            NumKind::I => (types::I64, types::I64X2),
+            NumKind::F => (types::F64, types::F64X2),
+        };
+
+        let mut min_len = self.b.ins().load(types::I64, trusted, base_out, 0);
+        for &base in arrays {
+            let len = self.b.ins().load(types::I64, trusted, base, 0);
+            min_len = self.b.ins().smin(min_len, len);
+        }
+        // Largest even n <= min_len (clears the low bit); safe for a
+        // negative min_len too (never occurs — buffer lengths are
+        // non-negative by construction) since it only ever moves `vec_end`
+        // further from 0 in magnitude, and the `i < vec_end` loop guard
+        // below still degenerates to zero iterations.
+        let vec_end = self.b.ins().band_imm(min_len, -2i64);
+        // The broadcast operand, typed once outside the loop.
+        let scalar = scalar.map(|w| {
+            let sv = match kind {
+                NumKind::I => w,
+                NumKind::F => self.as_f(w),
+            };
+            (sv, self.b.ins().splat(vty, sv))
+        });
+
+        // --- vectorized loop: i = 0, 2, 4, ... while i < vec_end ---------
+        let zero = self.iconst(0);
+        let loop_b = self.b.create_block();
+        self.b.append_block_param(loop_b, types::I64);
+        self.b.ins().jump(loop_b, &[BlockArg::from(zero)]);
+
+        self.b.switch_to_block(loop_b);
+        // Not sealed yet: the back edge from `body_b` (below) is the loop's
+        // second predecessor and hasn't been emitted yet.
+        let i = self.b.block_params(loop_b)[0];
+        let cont = self.b.ins().icmp(IntCC::SignedLessThan, i, vec_end);
+        let body_b = self.b.create_block();
+        let after_vec_b = self.b.create_block();
+        self.b.ins().brif(cont, body_b, &[], after_vec_b, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b); // single predecessor: loop_b, known now
+        let mut xs = vec![];
+        for &base in arrays {
+            let addr = self.elem_addr(base, i);
+            xs.push(self.b.ins().load(vty, unaligned, addr, 0));
+        }
+        xs.extend(scalar.map(|(_, v)| v));
+        let vr = lane(self, &xs);
+        let addr_out = self.elem_addr(base_out, i);
+        self.b.ins().store(unaligned, vr, addr_out, 0);
+        let next_i = self.b.ins().iadd_imm(i, 2);
+        self.b.ins().jump(loop_b, &[BlockArg::from(next_i)]);
+        self.b.seal_block(loop_b); // both predecessors known now
+
+        self.b.switch_to_block(after_vec_b);
+        self.b.seal_block(after_vec_b); // single predecessor: loop_b's brif
+
+        // --- scalar tail: one more element iff min_len is odd -----------
+        let has_tail = self.b.ins().icmp(IntCC::NotEqual, min_len, vec_end);
+        let tail_b = self.b.create_block();
+        let done_b = self.b.create_block();
+        self.b.ins().brif(has_tail, tail_b, &[], done_b, &[]);
+
+        self.b.switch_to_block(tail_b);
+        self.b.seal_block(tail_b); // single predecessor: after_vec_b's brif
+        // Scalar element loads/stores are always 8-byte offsets from an
+        // 8-byte-aligned base, so (unlike the vector path) `trusted`'s
+        // `aligned` bit is honest here too.
+        let mut xs = vec![];
+        for &base in arrays {
+            let addr = self.elem_addr(base, vec_end);
+            xs.push(self.b.ins().load(sty, trusted, addr, 0));
+        }
+        xs.extend(scalar.map(|(s, _)| s));
+        let sr = lane(self, &xs);
+        let addr_out = self.elem_addr(base_out, vec_end);
+        self.b.ins().store(trusted, sr, addr_out, 0);
+        self.b.ins().jump(done_b, &[]);
+
+        self.b.switch_to_block(done_b);
+        // Two predecessors: tail_b's jump (just emitted) and after_vec_b's
+        // brif else-arm (emitted above) — both known now.
+        self.b.seal_block(done_b);
+        base_out
+    }
+
+    /// `x OP y` for [`Core::ArrayMap2`], on 2-lane vector operands
+    /// (`I64X2`/`F64X2`) or scalar `I64`/`F64` ones (the odd-length tail) —
+    /// wrapping for int64 (plain `iadd`/`isub`/`imul` are already
+    /// two's-complement wraparound, matching `wrapping_add`/`wrapping_sub`/
+    /// `wrapping_mul`; no per-lane overflow flag exists to set, which is the
+    /// whole reason [`Core::ArrayMap2`] is defined as wrapping, and the tail
+    /// never touches the `OVERFLOW`/`DIV_BY_ZERO` `Ctx` flags either). Only
+    /// `Add`/`Sub`/`Mul` are ever constructed for this node.
+    fn lane_bin(&mut self, op: BinOp, kind: NumKind, x: Value, y: Value) -> Value {
+        match (kind, op) {
+            (NumKind::I, BinOp::Add) => self.b.ins().iadd(x, y),
+            (NumKind::I, BinOp::Sub) => self.b.ins().isub(x, y),
+            (NumKind::I, BinOp::Mul) => self.b.ins().imul(x, y),
+            (NumKind::F, BinOp::Add) => self.b.ins().fadd(x, y),
+            (NumKind::F, BinOp::Sub) => self.b.ins().fsub(x, y),
+            (NumKind::F, BinOp::Mul) => self.b.ins().fmul(x, y),
+            _ => unreachable!("ArrayMap2 only ever carries Add/Sub/Mul"),
+        }
+    }
+
+    /// Lower [`Core::ArraySum`] (`base_b == None`) and [`Core::ArrayDot`]
+    /// (`base_b == Some(..)`) for either element kind.
+    ///
+    /// Main loop steps 8 elements with FOUR 2-lane vector accumulators
+    /// (`I64X2`/`F64X2`): `acc_k` covers indices `i+2k, i+2k+1`, i.e. lane
+    /// `j` of the 8 strided lanes of [`crate::f64_reduce_by`]. After the loop
+    /// the accumulators combine as `(acc0+acc1)+(acc2+acc3)` and then
+    /// `lane0+lane1` — exactly `((l0+l2)+(l4+l6)) + ((l1+l3)+(l5+l7))` — and
+    /// a scalar tail loop adds the remaining `< 8` elements in order. For
+    /// int64 (wrapping, associative) any shape is exact; for float64 the
+    /// language leaves addition order unspecified (Fortran `SUM`), and this
+    /// shape happens to match the interpreter tiers bit-for-bit. Dot uses a
+    /// separate multiply then add (no FMA). Returns the result as I64 bits.
+    fn emit_array_reduce(&mut self, kind: NumKind, base_a: Value, base_b: Option<Value>) -> Value {
+        let trusted = MemFlagsData::trusted();
+        let unaligned = MemFlagsData::new().with_notrap();
+        let (sty, vty) = match kind {
+            NumKind::I => (types::I64, types::I64X2),
+            NumKind::F => (types::F64, types::F64X2),
+        };
+
+        let len_a = self.b.ins().load(types::I64, trusted, base_a, 0);
+        let n = match base_b {
+            Some(bb) => {
+                let len_b = self.b.ins().load(types::I64, trusted, bb, 0);
+                self.b.ins().smin(len_a, len_b)
+            }
+            None => len_a,
+        };
+        // Largest multiple of 8 <= n (n <= 0 gives <= 0: loop skipped).
+        let vec_end = self.b.ins().band_imm(n, -8i64);
+
+        let zero = self.iconst(0);
+        let szero = match kind {
+            NumKind::I => zero,
+            NumKind::F => self.b.ins().f64const(0.0),
+        };
+        let zero_vec = self.b.ins().splat(vty, szero);
+
+        // --- vector loop: i = 0, 8, 16, ... while i < vec_end ----------
+        let loop_b = self.b.create_block();
+        self.b.append_block_param(loop_b, types::I64); // i
+        for _ in 0..4 {
+            self.b.append_block_param(loop_b, vty);
+        }
+        let mut init = vec![BlockArg::from(zero)];
+        init.extend((0..4).map(|_| BlockArg::from(zero_vec)));
+        self.b.ins().jump(loop_b, &init);
+
+        self.b.switch_to_block(loop_b);
+        let params: Vec<Value> = self.b.block_params(loop_b).to_vec();
+        let i = params[0];
+        let accs = [params[1], params[2], params[3], params[4]];
+        let cont = self.b.ins().icmp(IntCC::SignedLessThan, i, vec_end);
+        let body_b = self.b.create_block();
+        let after_vec_b = self.b.create_block();
+        self.b.ins().brif(cont, body_b, &[], after_vec_b, &[]);
+
+        self.b.switch_to_block(body_b);
+        self.b.seal_block(body_b);
+        let addr_a = self.elem_addr(base_a, i);
+        let addr_b = base_b.map(|bb| self.elem_addr(bb, i));
+        let mut next = vec![];
+        for (k, acc) in accs.iter().enumerate() {
+            let off = 16 * k as i32;
+            let va = self.b.ins().load(vty, unaligned, addr_a, off);
+            let term = match addr_b {
+                Some(ab) => {
+                    let vb = self.b.ins().load(vty, unaligned, ab, off);
+                    match kind {
+                        NumKind::I => self.b.ins().imul(va, vb),
+                        NumKind::F => self.b.ins().fmul(va, vb),
+                    }
+                }
+                None => va,
+            };
+            next.push(match kind {
+                NumKind::I => self.b.ins().iadd(*acc, term),
+                NumKind::F => self.b.ins().fadd(*acc, term),
+            });
+        }
+        let next_i = self.b.ins().iadd_imm(i, 8);
+        let mut back = vec![BlockArg::from(next_i)];
+        back.extend(next.into_iter().map(BlockArg::from));
+        self.b.ins().jump(loop_b, &back);
+        self.b.seal_block(loop_b);
+
+        self.b.switch_to_block(after_vec_b);
+        self.b.seal_block(after_vec_b);
+        let add = |s: &mut Self, x: Value, y: Value| match kind {
+            NumKind::I => s.b.ins().iadd(x, y),
+            NumKind::F => s.b.ins().fadd(x, y),
+        };
+        let p01 = add(self, accs[0], accs[1]);
+        let p23 = add(self, accs[2], accs[3]);
+        let pv = add(self, p01, p23);
+        let lane0 = self.b.ins().extractlane(pv, 0u8);
+        let lane1 = self.b.ins().extractlane(pv, 1u8);
+        let vec_sum = add(self, lane0, lane1);
+
+        // --- scalar tail loop: j = vec_end .. n, in order ----------------
+        let tail_b = self.b.create_block();
+        self.b.append_block_param(tail_b, types::I64); // j
+        self.b.append_block_param(tail_b, sty); // running sum
+        self.b
+            .ins()
+            .jump(tail_b, &[BlockArg::from(vec_end), BlockArg::from(vec_sum)]);
+        self.b.switch_to_block(tail_b);
+        let j = self.b.block_params(tail_b)[0];
+        let run = self.b.block_params(tail_b)[1];
+        let more = self.b.ins().icmp(IntCC::SignedLessThan, j, n);
+        let tbody_b = self.b.create_block();
+        let done_b = self.b.create_block();
+        self.b.ins().brif(more, tbody_b, &[], done_b, &[]);
+
+        self.b.switch_to_block(tbody_b);
+        self.b.seal_block(tbody_b);
+        let sa_addr = self.elem_addr(base_a, j);
+        let sa = self.b.ins().load(sty, trusted, sa_addr, 0);
+        let term = match base_b {
+            Some(bb) => {
+                let sb_addr = self.elem_addr(bb, j);
+                let sb = self.b.ins().load(sty, trusted, sb_addr, 0);
+                match kind {
+                    NumKind::I => self.b.ins().imul(sa, sb),
+                    NumKind::F => self.b.ins().fmul(sa, sb),
+                }
+            }
+            None => sa,
+        };
+        let run2 = add(self, run, term);
+        let j2 = self.b.ins().iadd_imm(j, 1);
+        self.b
+            .ins()
+            .jump(tail_b, &[BlockArg::from(j2), BlockArg::from(run2)]);
+        self.b.seal_block(tail_b);
+
+        self.b.switch_to_block(done_b);
+        self.b.seal_block(done_b);
+        match kind {
+            NumKind::I => run,
+            NumKind::F => self.as_i(run),
+        }
+    }
+
+    /// Evaluate `then`/`else` and merge their values through a single block
+    /// parameter on `merge_b`. Neither branch can tail-loop here (this variant
+    /// is only used for non-tail merges — bounds-checked accesses and
+    /// CODE-CHAR narrowing), so both always jump to the merge.
+    fn branch_to_slot(
+        &mut self,
+        cond: Value,
+        then_f: impl FnOnce(&mut Self) -> Value,
+        else_f: impl FnOnce(&mut Self) -> Value,
+    ) -> Value {
+        let then_b = self.b.create_block();
+        let else_b = self.b.create_block();
+        let merge_b = self.b.create_block();
+        let merge_param = self.b.append_block_param(merge_b, types::I64);
+
+        self.b.ins().brif(cond, then_b, &[], else_b, &[]);
+
+        self.b.switch_to_block(then_b);
+        self.b.seal_block(then_b);
+        let tv = then_f(self);
+        self.b.ins().jump(merge_b, &[BlockArg::from(tv)]);
+
+        self.b.switch_to_block(else_b);
+        self.b.seal_block(else_b);
+        let ev = else_f(self);
+        self.b.ins().jump(merge_b, &[BlockArg::from(ev)]);
+
+        self.b.switch_to_block(merge_b);
+        self.b.seal_block(merge_b);
+        merge_param
+    }
+
+    /// Emit a non-tail call to typed function `id`, guarded by the depth
+    /// cap (issue #271): every non-tail call — whether it ends up taking the
+    /// direct native `call_indirect` fast path or falling back to the host
+    /// trampoline — grows *some* call stack (native or, via the trampoline,
+    /// `Ctx::call`'s own Rust recursion) once per call, unbounded without
+    /// this. `jit_enter_call`/`jit_exit_call` mirror `Ctx::enter_call`/
+    /// `exit_call` so the fast path — which never otherwise touches
+    /// `Ctx::call` at all — is covered too, not just the trampoline-routed
+    /// cases (which would also be caught by `Ctx::call`'s own guard, one
+    /// frame further in).
+    fn emit_call(&mut self, id: usize, args: &[Core]) -> Value {
+        let vals: Vec<Value> = args.iter().map(|a| self.emit_value(a)).collect();
+        let argc = vals.len();
+        let buf = self.b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (argc.max(1) * 8) as u32,
+            3,
+        ));
+        for (i, v) in vals.iter().enumerate() {
+            self.b.ins().stack_store(*v, buf, (i * 8) as i32);
+        }
+        let buf_addr = self.b.ins().stack_addr(self.ptr, buf, 0);
+
+        let ok = {
+            let ec = self.b.ins().call(self.enter_call_ref, &[self.ctx_ptr]);
+            self.b.inst_results(ec)[0]
+        };
+        let allowed = self.b.ins().icmp_imm(IntCC::NotEqual, ok, 0);
+
+        let outer_res =
+            self.b
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let call_b = self.b.create_block();
+        let over_limit_b = self.b.create_block();
+        let outer_merge_b = self.b.create_block();
+        self.b.ins().brif(allowed, call_b, &[], over_limit_b, &[]);
+
+        // Depth cap hit: `jit_enter_call` already recorded the pending
+        // recursion-limit error; skip the call entirely and substitute a
+        // zero-length arena buffer — a valid, non-null pointer that is also
+        // a harmless plain integer if the caller treats this call's result
+        // as a scalar. The membrane discards it once it sees the error.
+        self.b.switch_to_block(over_limit_b);
+        self.b.seal_block(over_limit_b);
+        let zero_len = self.iconst(0);
+        let sentinel = self.alloc(zero_len);
+        self.b.ins().stack_store(sentinel, outer_res, 0);
+        self.b.ins().jump(outer_merge_b, &[]);
+
+        self.b.switch_to_block(call_b);
+        self.b.seal_block(call_b);
+        let call_result = self.emit_call_unguarded(id, argc, buf_addr);
+        self.b.ins().call(self.exit_call_ref, &[self.ctx_ptr]);
+        // A direct native callee that ended in a cross-function tail call
+        // returned only a placeholder and parked the real call in the ctx
+        // pending cell; resolve it HERE so it can never leak upward and
+        // replace this function's own result at the top-level invoke loop.
+        let resolved = {
+            let rc = self
+                .b
+                .ins()
+                .call(self.resolve_pending_ref, &[self.ctx_ptr, call_result]);
+            self.b.inst_results(rc)[0]
+        };
+        self.b.ins().stack_store(resolved, outer_res, 0);
+        self.b.ins().jump(outer_merge_b, &[]);
+
+        self.b.switch_to_block(outer_merge_b);
+        self.b.seal_block(outer_merge_b);
+        self.b.ins().stack_load(types::I64, outer_res, 0)
+    }
+
+    /// The actual call dispatch `emit_call` wraps with the depth guard:
+    /// arity-mismatch/native-direct/trampoline selection, unchanged from
+    /// before issue #271 other than taking the already-built argument buffer.
+    fn emit_call_unguarded(&mut self, id: usize, argc: usize, buf_addr: Value) -> Value {
+        // If the call-site arity disagrees with the callee's current param count
+        // (callee was redefined with a different arity after this function's Core
+        // was elaborated), skip the native fast path and always route through the
+        // trampoline.  The arity guard in `invoke_once` will then skip the callee's
+        // native edition too, avoiding an out-of-bounds read in its native prologue.
+        let arity_mismatch = id < self.param_counts.len() && argc != self.param_counts[id];
+
+        if arity_mismatch {
+            let id_v = self.iconst(id as i64);
+            let argc_v = self.iconst(argc as i64);
+            let sc = self
+                .b
+                .ins()
+                .call(self.tramp_ref, &[self.ctx_ptr, id_v, buf_addr, argc_v]);
+            return self.b.inst_results(sc)[0];
+        }
+
+        // Load the callee's current native entry from its (heap-stable) cell.
+        // Non-zero -> call it directly (no host round-trip); zero -> the callee
+        // has no native edition right now, so route through the trampoline,
+        // which dispatches to its closure/interpreter edition.
+        let cell_v = self.b.ins().iconst(self.ptr, self.cell_addrs[id] as i64);
+        let entry = self
+            .b
+            .ins()
+            .load(self.ptr, MemFlagsData::trusted(), cell_v, 0);
+        let zero = self.b.ins().iconst(self.ptr, 0);
+        let is_native = self.b.ins().icmp(IntCC::NotEqual, entry, zero);
+
+        let res =
+            self.b
+                .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let direct_b = self.b.create_block();
+        let slow_b = self.b.create_block();
+        let merge_b = self.b.create_block();
+        self.b.ins().brif(is_native, direct_b, &[], slow_b, &[]);
+
+        // Fast path: direct native call_indirect.
+        self.b.switch_to_block(direct_b);
+        self.b.seal_block(direct_b);
+        let dc = self
+            .b
+            .ins()
+            .call_indirect(self.callee_sig, entry, &[buf_addr, self.ctx_ptr]);
+        let dr = self.b.inst_results(dc)[0];
+        self.b.ins().stack_store(dr, res, 0);
+        self.b.ins().jump(merge_b, &[]);
+
+        // Slow path: host trampoline -> registry dispatch.
+        self.b.switch_to_block(slow_b);
+        self.b.seal_block(slow_b);
+        let id_v = self.iconst(id as i64);
+        let argc_v = self.iconst(argc as i64);
+        let sc = self
+            .b
+            .ins()
+            .call(self.tramp_ref, &[self.ctx_ptr, id_v, buf_addr, argc_v]);
+        let sr = self.b.inst_results(sc)[0];
+        self.b.ins().stack_store(sr, res, 0);
+        self.b.ins().jump(merge_b, &[]);
+
+        self.b.switch_to_block(merge_b);
+        self.b.seal_block(merge_b);
+        self.b.ins().stack_load(types::I64, res, 0)
+    }
+}
+
+fn int_cc(op: CmpOp) -> IntCC {
+    match op {
+        CmpOp::Lt => IntCC::SignedLessThan,
+        CmpOp::Gt => IntCC::SignedGreaterThan,
+        CmpOp::Le => IntCC::SignedLessThanOrEqual,
+        CmpOp::Ge => IntCC::SignedGreaterThanOrEqual,
+        CmpOp::Eq => IntCC::Equal,
+        CmpOp::Ne => IntCC::NotEqual,
+    }
+}
+
+fn float_cc(op: CmpOp) -> FloatCC {
+    match op {
+        CmpOp::Lt => FloatCC::LessThan,
+        CmpOp::Gt => FloatCC::GreaterThan,
+        CmpOp::Le => FloatCC::LessThanOrEqual,
+        CmpOp::Ge => FloatCC::GreaterThanOrEqual,
+        CmpOp::Eq => FloatCC::Equal,
+        CmpOp::Ne => FloatCC::NotEqual,
+    }
+}

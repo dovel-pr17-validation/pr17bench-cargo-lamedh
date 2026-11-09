@@ -1,0 +1,19 @@
+;;;; lamedh.asd -- ASDF system definition for the SBCL port of Lamedh.
+
+(asdf:defsystem "lamedh"
+  :description "A standalone Common Lisp (SBCL) implementation of the Lamedh Lisp 1.5 dialect."
+  :author "Lamedh contributors"
+  :license "AGPL-3.0"
+  :pathname "src"
+  :depends-on ((:require "sb-md5"))
+  :serial t
+  :components ((:file "package")
+               (:file "reader")
+               (:file "runtime")
+               (:file "printer")
+               (:file "builtins")
+               (:file "compile")
+               (:file "extra")
+               (:file "io")
+               (:file "bootstrap")
+               (:file "cli")))

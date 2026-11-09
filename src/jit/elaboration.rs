@@ -1,0 +1,3323 @@
+use super::*;
+// ---------------------------------------------------------------------------
+// Elaboration = lowering + monomorphic type checking, in one pass.
+// ---------------------------------------------------------------------------
+
+pub(super) type Scope = Vec<(String, Ty)>;
+
+/// Source of a plain lambda's (params, body) for on-demand call-site
+/// checking (#308) — backed by the environment in checker entry points.
+pub(super) type LambdaSource<'a> = &'a dyn Fn(&str) -> Option<(Vec<String>, Vec<LispVal>)>;
+
+/// Elaboration context: read-only access to the signatures of all registered
+/// functions, so call sites can be type-checked (and self/forward references
+/// resolved) while a body is being elaborated.
+pub(super) struct Cx<'a> {
+    pub(super) funcs: &'a [Rc<TypedFn>],
+    pub(super) by_name: &'a HashMap<String, usize>,
+    pub(super) structs: &'a HashMap<String, Rc<StructDef>>,
+    /// Parametric nominals (0.3 HM generics), for construction rules.
+    pub(super) generics: &'a HashMap<String, Rc<GenericDef>>,
+    /// Declared sum types, for the `variant-case` eliminator rule (#350):
+    /// the scrutinee unifies with a clause ctor's OWNING variant, found here.
+    pub(super) variants: &'a HashMap<String, Rc<VariantDef>>,
+    /// Declared schemes (experimental rows): axioms from `declare-type!`,
+    /// consulted by the checker for callees the typed registry doesn't know.
+    pub(super) declared: &'a HashMap<String, infer::Scheme>,
+    /// Protocol instance schemes (0.3): multiple per name, selected by the
+    /// dispatch argument's inferred shape.
+    pub(super) protocols: &'a HashMap<String, Vec<infer::Scheme>>,
+    /// Which argument position a protocol dispatches on (absent = 0).
+    /// Fn-first protocols like `map` dispatch on position 1.
+    pub(super) protocol_dispatch: &'a HashMap<String, usize>,
+    /// The inference state for this definition: fresh variables + substitution
+    /// (issue #135). Held behind a `RefCell` so the elaboration methods keep
+    /// their `&self` signatures while still threading one shared substitution.
+    pub(super) infer: RefCell<Infer>,
+    /// Checker mode (#162): when set, elaboration types the *full* checkable
+    /// lattice (lists, pairs, symbols, strings) and degrades an unknown/untyped
+    /// call to `Any` (the gradual frontier) instead of rejecting it. The produced
+    /// [`Core`] is *not* used (the checker never compiles), only the types are.
+    /// When unset (the codegen path), behavior is unchanged: every type must be
+    /// compileable and unknown calls are errors.
+    pub(super) checking: bool,
+    /// Call-site consultation of INFERRED schemes (#308): resolves an unknown
+    /// callee that is a plain lambda to its (params, body) so its scheme can
+    /// be derived on demand instead of degrading the call to `Any`. `None` in
+    /// codegen mode and in contexts with no environment access.
+    pub(super) resolver: Option<LambdaSource<'a>>,
+    /// Per-run memo of schemes derived through `resolver`. `None` records a
+    /// callee that could not be derived (variadic, failed its own check, not
+    /// a lambda) so it is not re-attempted; such calls stay gradual — the
+    /// callee's own error is reported at its own definition, not here.
+    pub(super) derived: RefCell<HashMap<String, Option<infer::Scheme>>>,
+    /// Monotype arrow assumptions for callees currently being checked
+    /// up-stack (self/mutual recursion), consulted before re-entering the
+    /// resolver so cycles terminate.
+    pub(super) assumptions: RefCell<HashMap<String, Ty>>,
+    /// Type-variable ids of enclosing in-flight checks. A nested callee's
+    /// scheme is generalized *avoiding* these — see
+    /// [`Infer::generalize_avoiding`].
+    pub(super) avoid_gen: RefCell<Vec<u32>>,
+}
+
+/// Issue #476: a `boxed` handle is inert cargo — the only operations that
+/// may look inside one are the boxed intrinsics (`equal`, `hash-code`,
+/// `fetch`/`store`/`array-length*`). Arithmetic and ordering comparison are
+/// meaningless on a handle word (it is a root-table index, not a number),
+/// and critically: two DISTINCT handles can denote the SAME underlying
+/// object (aliasing, `Ty::Boxed`'s own doc comment), so comparing handle
+/// words with `Core::Cmp` would be outright wrong, not merely disallowed —
+/// no `Core::Cmp` node may ever be elaborated at boxed type. This message is
+/// shared by every arithmetic/comparison elaborator so the guard reads
+/// identically everywhere it fires.
+pub(super) const BOXED_ARITH_CMP_MSG: &str =
+    "boxed values support only movement, equal, hash-code, and general-array access";
+
+impl Cx<'_> {
+    /// A fresh type variable from this definition's inference state.
+    fn fresh(&self) -> Ty {
+        self.infer.borrow_mut().fresh()
+    }
+
+    /// Reject an operand whose WALKED type is already known to be `boxed`
+    /// (issue #476). Used by every arithmetic/comparison elaborator, in both
+    /// checker and codegen mode, so a boxed operand is refused uniformly —
+    /// and, for comparison, so no `Core::Cmp` node is ever built over it.
+    fn reject_boxed_arith_cmp(&self, t: &Ty) -> Result<(), String> {
+        if matches!(self.walk(t), Ty::Boxed) {
+            return Err(BOXED_ARITH_CMP_MSG.to_string());
+        }
+        Ok(())
+    }
+
+    /// An integer LITERAL in source (issue #530): the only int form that may
+    /// be coerced to `float64`. There is no general int→float subtyping — an
+    /// int-typed variable or expression is never coerced.
+    fn int_literal(form: &LispVal) -> Option<i64> {
+        match form {
+            LispVal::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Is `t` already known to be `float64` under the substitution?
+    fn is_float(&self, t: &Ty) -> bool {
+        matches!(self.walk(t), Ty::Float64)
+    }
+
+    /// A resolved operand type the EVALUATOR would reject for arithmetic /
+    /// numeric comparison (#322): known non-numerics fail the check early;
+    /// variables and Any stay gradual. Char is numeric (byte arithmetic).
+    fn known_non_numeric(w: &Ty) -> bool {
+        matches!(
+            w,
+            Ty::Str
+                | Ty::Symbol
+                | Ty::Bool
+                | Ty::List(_)
+                | Ty::Pair(_, _)
+                | Ty::Record(_, _)
+                | Ty::Struct(_)
+                | Ty::Variant(_)
+        )
+    }
+    /// Ground types that can never be a list: a `cons` onto one of these
+    /// is a dotted pair, not a list extension.
+    fn known_non_list(w: &Ty) -> bool {
+        matches!(
+            w,
+            Ty::Int64
+                | Ty::Float64
+                | Ty::Bool
+                | Ty::Char
+                | Ty::Str
+                | Ty::Symbol
+                | Ty::Array(_)
+                | Ty::Struct(_)
+                | Ty::Variant(_)
+                | Ty::Fn(_, _)
+                | Ty::Record(_, _)
+                | Ty::Pair(_, _)
+        )
+    }
+    /// Unify two types, extending the substitution (or report the clash).
+    pub(super) fn unify(&self, a: &Ty, b: &Ty) -> Result<(), String> {
+        self.infer.borrow_mut().unify(a, b)
+    }
+    /// Read a type's current representative under the substitution (for
+    /// diagnostics; may still be a variable).
+    pub(super) fn walk(&self, t: &Ty) -> Ty {
+        self.infer.borrow().walk(t)
+    }
+    /// Resolve a type to a concrete type, erroring if it is still ambiguous.
+    pub(super) fn resolve(&self, t: &Ty) -> Result<Ty, String> {
+        self.infer.borrow().resolve(t)
+    }
+
+    fn elab(
+        &self,
+        form: &LispVal,
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        match form {
+            LispVal::Number(n) => Ok((Core::LitI(*n), Ty::Int64)),
+            LispVal::Float(f) => Ok((Core::LitF(*f), Ty::Float64)),
+            LispVal::Symbol(s) => {
+                let name = &s.borrow().name;
+                if name == "TRUE" {
+                    return Ok((Core::LitI(1), Ty::Bool));
+                }
+                if name == "FALSE" {
+                    return Ok((Core::LitI(0), Ty::Bool));
+                }
+                match scope.iter().rposition(|(n, _)| n == name) {
+                    Some(slot) => Ok((Core::Var(slot), scope[slot].1.clone())),
+                    // `t` is the canonical true (#505): a checker-mode `bool`,
+                    // the same type a comparison or predicate produces, so a
+                    // `t`/`nil` function types as `bool` instead of letting an
+                    // absorbing `Any` vanish into a quantified return.
+                    None if self.checking && name == "T" => Ok((Core::LitI(1), Ty::Bool)),
+                    // A free symbol in checker mode is some global we don't track
+                    // — the gradual frontier (`Any`). The codegen path rejects it.
+                    None if self.checking => Ok((Core::LitI(0), Ty::Any)),
+                    None => Err(format!("unbound variable: {name}")),
+                }
+            }
+            // Checker-only literals (#162): a boxed string is `string`, `nil`/`()`
+            // is an empty list of some element type. The codegen path rejects them.
+            LispVal::String(_) if self.checking => Ok((Core::LitI(0), Ty::Str)),
+            LispVal::Char(_) if self.checking => Ok((Core::LitI(0), Ty::Char)),
+            LispVal::Nil if self.checking => Ok((Core::LitI(0), Ty::List(Box::new(self.fresh())))),
+            LispVal::Cons { .. } => {
+                let items = list_to_vec(form);
+                let head = match items.first() {
+                    Some(LispVal::Symbol(s)) => s.borrow().name.clone(),
+                    _ => return Err("typed core: call head must be a symbol".to_string()),
+                };
+                let args = &items[1..];
+                match head.as_str() {
+                    // `quotient` is the evaluator's classic name for `/` (the
+                    // same builtin); `remainder`/`rem` are its truncated
+                    // remainder (#522).
+                    "+" | "-" | "*" | "/" | "QUOTIENT" | "MOD" | "REMAINDER" | "REM" => {
+                        self.elab_bin(&head, args, scope, max)
+                    }
+                    "<" | ">" | "<=" | ">=" | "=" | "/=" => self.elab_cmp(&head, args, scope, max),
+                    "NOT" => self.elab_not(args, scope, max),
+                    "AND" | "OR" => self.elab_logic(&head, args, scope, max),
+                    "IF" => self.elab_if(args, scope, max),
+                    // `let`/`progn` compile natively (issue: "fix the language"):
+                    // `elab_let` emits a real `Core::Let` and `elab_body` a real
+                    // `Core::Seq`, the same nodes `LET-TYPED` already lowers, so a
+                    // typed body using ordinary `let`/`progn` reaches the native
+                    // tier instead of stalling at CHECKED. `LET-TYPED` stays as the
+                    // explicit-annotation spelling; it and `LET` share `elab_let`.
+                    // `elab_let` binds sequentially, each init seeing the
+                    // bindings before it: exactly `let*` (#513). `let*` takes
+                    // only the evaluator's shapes (#522); see `check_let_star`.
+                    "LET" | "LET-TYPED" => self.elab_let(args, false, scope, max),
+                    "LET*" => {
+                        check_let_star(args)?;
+                        self.elab_let(args, false, scope, max)
+                    }
+                    "PROGN" => self.elab_body(args, scope, max),
+                    // `setq`/`while`/`for` compile natively when they only touch
+                    // local slots (params/let-bindings) — codegen-only so
+                    // checking (which never runs this Core) keeps whatever
+                    // gradual/declared handling these forms already had.
+                    "SETQ" if !self.checking => self.elab_setq(args, scope, max),
+                    "WHILE" if !self.checking => self.elab_while(args, scope, max),
+                    "FOR" if !self.checking => self.elab_for(args, scope, max),
+                    // `cond`/`when`/`unless`/`case` compile by desugaring to
+                    // nested `if` (#404); see `desugar_branch`.
+                    "COND" | "WHEN" | "UNLESS" | "CASE" if !self.checking => {
+                        let d = desugar_branch(&head, args, false)?;
+                        self.elab(&d, scope, max)
+                    }
+                    // `dotimes` (a macro in lib/12-control.lisp, #403) is
+                    // desugared here to exactly its expansion — `let` + `for`
+                    // + optional result `let` — so a defun using it reaches the
+                    // native tier like a hand-written `for`.
+                    "DOTIMES" if !self.checking => self.elab_dotimes(args, scope, max),
+                    "CHAR-CODE" => self.elab_char_code(args, scope, max),
+                    "CODE-CHAR" => self.elab_code_char(args, scope, max),
+                    "ARRAY" | "MAKE-ARRAY" => self.elab_array_new(args, scope, max),
+                    "FETCH" | "AREF" => self.elab_fetch(args, scope, max),
+                    "STORE" | "ASET" => self.elab_store(args, scope, max),
+                    "ARRAY-LENGTH*" => self.elab_array_len(args, scope, max),
+                    // Boxed-handle intrinsics (issue #476 phase 3b/3c):
+                    // `equal`/`hash-code` dispatch to `Core::BoxedOp` only
+                    // when an operand is boxed; otherwise they fall through
+                    // to the same call path they'd have reached with no
+                    // dispatch entry at all (see each `elab_*`'s doc comment).
+                    "EQUAL" => self.elab_equal(args, scope, max),
+                    "HASH-CODE" => self.elab_hash_code(args, scope, max),
+                    // Unary float intrinsics ("fix the language"): compile to
+                    // native. Codegen-only (`!checking`) so checking keeps the
+                    // permissive declared schemes from lib/28-types.lisp (arg
+                    // `any`); in codegen the arg must be concrete `float64` or
+                    // the function stays interpreted. `sqrt` yields `float64`;
+                    // `floor`/`ceiling`/`truncate` yield `int64` (like the
+                    // evaluator). `round` and the transcendentals need a libm
+                    // trampoline and are handled separately.
+                    "SQRT" if !self.checking => {
+                        self.elab_funary(FUnOp::Sqrt, Ty::Float64, args, scope, max)
+                    }
+                    "FLOOR" if !self.checking => {
+                        self.elab_funary(FUnOp::Floor, Ty::Int64, args, scope, max)
+                    }
+                    "CEILING" if !self.checking => {
+                        self.elab_funary(FUnOp::Ceil, Ty::Int64, args, scope, max)
+                    }
+                    "TRUNCATE" if !self.checking => {
+                        self.elab_funary(FUnOp::Trunc, Ty::Int64, args, scope, max)
+                    }
+                    // Transcendentals + half-away `round` via the libm
+                    // trampoline (`jit_ftrans`). Same codegen-only gating.
+                    "SIN" if !self.checking => {
+                        self.elab_funary(FUnOp::Sin, Ty::Float64, args, scope, max)
+                    }
+                    "COS" if !self.checking => {
+                        self.elab_funary(FUnOp::Cos, Ty::Float64, args, scope, max)
+                    }
+                    "TAN" if !self.checking => {
+                        self.elab_funary(FUnOp::Tan, Ty::Float64, args, scope, max)
+                    }
+                    "EXP" if !self.checking => {
+                        self.elab_funary(FUnOp::Exp, Ty::Float64, args, scope, max)
+                    }
+                    // Natural `log` (1 argument; the 2-argument base form
+                    // stays interpreted) and `expt` (#398).
+                    "LOG" if !self.checking => {
+                        self.elab_funary(FUnOp::Log, Ty::Float64, args, scope, max)
+                    }
+                    "EXPT" if !self.checking => self.elab_expt(args, scope, max),
+                    "ROUND" if !self.checking => {
+                        self.elab_funary(FUnOp::Round, Ty::Int64, args, scope, max)
+                    }
+                    "FLOAT" if !self.checking => self.elab_float(args, scope, max),
+                    // Bitwise ops on int64 ("fix the language"): compile to
+                    // native. Variadic AND/OR/XOR fold into nested `Bin`s;
+                    // `ash` compiles only for a compile-time in-range constant
+                    // shift (folded to a left/right shift). Codegen-only so
+                    // checking keeps the declared/variadic schemes.
+                    "LOGAND" if !self.checking => {
+                        self.elab_bitwise(BinOp::BitAnd, -1, args, scope, max)
+                    }
+                    "LOGIOR" if !self.checking => {
+                        self.elab_bitwise(BinOp::BitOr, 0, args, scope, max)
+                    }
+                    "LOGXOR" if !self.checking => {
+                        self.elab_bitwise(BinOp::BitXor, 0, args, scope, max)
+                    }
+                    "ASH" if !self.checking => self.elab_ash(args, scope, max),
+                    // `abs`/`min`/`max` compile by DESUGARING to `if`+comparison
+                    // (already-compilable Core), mirroring their Lisp definitions
+                    // in lib/05-math.lisp — `(abs x)` = `(if (< x 0) (- x) x)`.
+                    // `min`/`max` on int64 are the comparison select
+                    // `(if (< a b) a b)` / `(if (> a b) a b)`. On float64 they
+                    // implement IEEE 754-2019 `minimum`/`maximum` (NaN
+                    // propagates, -0.0 < +0.0; see `float_min_max_step`), which
+                    // the evaluator matches. `abs` stays a comparison select, so
+                    // `(abs -0.0)` is `+0.0` via `x + 0` (#518). min/max take
+                    // any arity >= 1 (#397); every argument is evaluated once
+                    // into a temp slot.
+                    "ABS" if !self.checking => self.elab_abs(args, scope, max),
+                    "MIN" if !self.checking => {
+                        self.elab_min_max_compiled(CmpOp::Lt, args, scope, max)
+                    }
+                    "MAX" if !self.checking => {
+                        self.elab_min_max_compiled(CmpOp::Gt, args, scope, max)
+                    }
+                    // Elementwise SIMD array ops ("fix the language"):
+                    // out-param, wrapping, min-length elementwise `+`/`-`/`*`
+                    // over two same-typed arrays. Codegen-only: the element
+                    // type must resolve to a concrete int64/float64 or the
+                    // whole function stays interpreted (same discipline as
+                    // the bitwise/float-intrinsic forms above).
+                    "ARRAY-ADD!" if !self.checking => {
+                        self.elab_array_map2(BinOp::Add, args, scope, max)
+                    }
+                    "ARRAY-SUB!" if !self.checking => {
+                        self.elab_array_map2(BinOp::Sub, args, scope, max)
+                    }
+                    "ARRAY-MUL!" if !self.checking => {
+                        self.elab_array_map2(BinOp::Mul, args, scope, max)
+                    }
+                    // The rest of the family (#394): `Core::ArrayOp`.
+                    "ARRAY-DIV!" if !self.checking => {
+                        self.elab_array_op(ArrOp::Div, args, scope, max)
+                    }
+                    "ARRAY-SCALE!" if !self.checking => {
+                        self.elab_array_op(ArrOp::Scale, args, scope, max)
+                    }
+                    "ARRAY-FMA!" if !self.checking => {
+                        self.elab_array_op(ArrOp::Fma, args, scope, max)
+                    }
+                    "ARRAY-NEG!" if !self.checking => {
+                        self.elab_array_op(ArrOp::Neg, args, scope, max)
+                    }
+                    // Allocating sugar (#394, from #393): a fresh `out` of
+                    // `min(len a, len b)` elements, then the `!` op.
+                    "ARRAY-ADD" if !self.checking => {
+                        self.elab_array_alloc(BinOp::Add, args, scope, max)
+                    }
+                    "ARRAY-SUB" if !self.checking => {
+                        self.elab_array_alloc(BinOp::Sub, args, scope, max)
+                    }
+                    "ARRAY-MUL" if !self.checking => {
+                        self.elab_array_alloc(BinOp::Mul, args, scope, max)
+                    }
+                    // SIMD array reductions: int64 wraps; float64 follows
+                    // Fortran `SUM` (addition order unspecified — see
+                    // `Core::ArraySum`'s doc comment). Codegen-only, same
+                    // discipline as the elementwise family above.
+                    "ARRAY-SUM" if !self.checking => self.elab_array_sum(args, scope, max),
+                    "ARRAY-DOT" if !self.checking => self.elab_array_dot(args, scope, max),
+                    // Checker-only forms (#162): list/pair processing + `quote`/
+                    // `cond`/`when` whose `elab_*` emit only a placeholder
+                    // `Core::LitI(0)` for type purposes — they typecheck untyped
+                    // `defun` bodies but must NOT reach codegen (they would
+                    // miscompile to literal 0), so they stay gated on `checking`.
+                    "CONS" if self.checking => self.elab_cons(args, scope, max),
+                    "CAR" | "FIRST" if self.checking => self.elab_car(args, scope, max),
+                    "CDR" | "REST" if self.checking => self.elab_cdr(args, scope, max),
+                    "LIST" if self.checking => self.elab_list(args, scope, max),
+                    "NULL" | "NULL?" | "ENDP" if self.checking => self.elab_null(args, scope, max),
+                    "RECORD-REF" if self.checking => self.elab_record_ref(args, scope, max),
+                    "RECORD-NEW" if self.checking => self.elab_record_new(args, scope, max),
+                    "RECORD-WITH" if self.checking => self.elab_record_with(args, scope, max),
+                    // Variadic-operator rules (0.3 census): declared schemes
+                    // are fixed-arity, so these get native rules like `+`.
+                    "APPEND" if self.checking => self.elab_append(args, scope, max),
+                    "CONCAT" if self.checking => {
+                        self.elab_mono_variadic(args, scope, max, Ty::Str, "concat")
+                    }
+                    "LOGAND" | "LOGIOR" | "LOGXOR" | "GCD" | "LCM" if self.checking => {
+                        self.elab_mono_variadic(args, scope, max, Ty::Int64, "bitwise/gcd")
+                    }
+                    "MIN" | "MAX" if self.checking => self.elab_min_max(args, scope, max),
+                    "QUOTE" if self.checking => self.elab_quote(args),
+                    "COND" if self.checking => self.elab_cond(args, scope, max),
+                    "CASE" if self.checking => self.elab_case_check(args, scope, max),
+                    "VARIANT-CASE" if self.checking => self.elab_variant_case(args, scope, max),
+                    "WHEN" | "UNLESS" if self.checking => self.elab_when(args, scope, max),
+                    _ => self.elab_call(&head, args, scope, max),
+                }
+            }
+            other if self.checking => {
+                // Any other literal the checker doesn't model is gradually `Any`.
+                let _ = other;
+                Ok((Core::LitI(0), Ty::Any))
+            }
+            other => Err(format!("typed core: unsupported literal {other:?}")),
+        }
+    }
+
+    fn elab_bin(
+        &self,
+        op: &str,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        // `+` and `*` support 0–N args; `-` requires at least 1 (unary
+        // negate, or N-ary left-fold). `/` (alias `QUOTIENT`), `MOD` and
+        // `REMAINDER` (alias `REM`, #522) are strictly BINARY in
+        // the evaluator (`BuiltinFunc::Divide` in `apply_math_op`,
+        // `builtins_core.rs`, and `mod` in `builtins_extra.rs` both reject
+        // anything but exactly 2 arguments — no unary reciprocal, no
+        // variadic chain division/modulus) and must be rejected at every
+        // other arity here too, rather than silently accepted with a
+        // made-up unary/N-ary meaning the evaluator doesn't have (issue
+        // #209 — the same "checker/compiler disagrees with the evaluator on
+        // what's valid" bug class as #202, but in the opposite,
+        // over-permissive direction).
+        let bop = match op {
+            "+" => BinOp::Add,
+            "-" => BinOp::Sub,
+            "*" => BinOp::Mul,
+            "/" | "QUOTIENT" => BinOp::Div,
+            "REMAINDER" | "REM" => BinOp::Rem,
+            _ => BinOp::Mod,
+        };
+        if matches!(bop, BinOp::Div | BinOp::Mod | BinOp::Rem) && args.len() != 2 {
+            return Err(format!(
+                "`{op}` requires exactly 2 arguments, got {}",
+                args.len()
+            ));
+        }
+        if matches!(bop, BinOp::Sub) && args.is_empty() {
+            return Err(format!("`{op}` requires at least 1 argument"));
+        }
+
+        // 0-arg identity: (+ ) = 0, (* ) = 1
+        if args.is_empty() {
+            let identity: i64 = if matches!(bop, BinOp::Mul) { 1 } else { 0 };
+            if self.checking {
+                return Ok((Core::LitI(identity), Ty::Int64));
+            }
+            return Ok((Core::LitI(identity), Ty::Int64));
+        }
+
+        // 1-arg: unary identity — (+ x) = x, (* x) = x, (- x) = (- 0 x).
+        // (`/`/`MOD`/`REMAINDER` can never reach here: pinned to exactly 2 args above.)
+        if args.len() == 1 {
+            let (a, ta) = self.elab(&args[0], scope, max)?;
+            self.reject_boxed_arith_cmp(&ta)?;
+            if self.checking {
+                return Ok((Core::LitI(0), self.walk(&ta)));
+            }
+            if matches!(bop, BinOp::Sub) {
+                // negate: (- x) => (zero - x), where `zero` is `0` for int64
+                // and `-0.0` for float64. `-0.0 - x` is IEEE negation for
+                // every x (`0.0 - 0.0` would turn `(- 0.0)` into `+0.0`; the
+                // evaluator gives `-0.0`).
+                let rt = self
+                    .resolve(&ta)
+                    .map_err(|_| format!("`{op}`: cannot infer operand type"))?;
+                let num = rt
+                    .as_num()
+                    .ok_or_else(|| format!("`{op}` expects a numeric operand, got {rt:?}"))?;
+                let zero = match num {
+                    NumTy::F => Core::LitF(-0.0),
+                    _ => Core::LitI(0),
+                };
+                return Ok((
+                    Core::Bin(num.into(), BinOp::Sub, Box::new(zero), Box::new(a)),
+                    rt,
+                ));
+            }
+            // (+ x), (* x) — just return the arg
+            return Ok((a, ta));
+        }
+
+        // ≥2 args: elaborate all, unify types pairwise, left-fold into BinOp
+        // tree. For `/`/`MOD`/`REMAINDER` this loop runs exactly once (arity pinned to 2
+        // above); only `+`/`-`/`*` ever reach a 3+-ary fold here.
+        //
+        // Issue #530: an integer LITERAL meeting a `float64` operand is
+        // elaborated as the float constant `n as f64`. This is exactly what
+        // the evaluator does (`apply_math_op`: any float operand promotes
+        // every argument with `as f64`), so the compiled result is the
+        // interpreter's. `+`/`*` fold left to right in both; the evaluator's
+        // N-ary `-` is `a - (b + c …)`, not the fold, so `-` coerces only
+        // at arity 2. `mod` is int-only and never coerces.
+        let coerces = match bop {
+            BinOp::Add | BinOp::Mul => true,
+            BinOp::Sub | BinOp::Div => args.len() == 2,
+            _ => false,
+        };
+        let (mut acc, mut ty) = self.elab(&args[0], scope, max)?;
+        self.reject_boxed_arith_cmp(&ty)?;
+        // The operands so far while they are ALL int literals (else `None`):
+        // a later `float64` operand re-elaborates this prefix as floats.
+        let mut lit_prefix: Option<Vec<i64>> = Self::int_literal(&args[0]).map(|n| vec![n]);
+        for arg in &args[1..] {
+            let (mut b, mut tb) = self.elab(arg, scope, max)?;
+            self.reject_boxed_arith_cmp(&tb)?;
+            let lit = Self::int_literal(arg);
+            if coerces
+                && self.is_float(&ty)
+                && let Some(n) = lit
+            {
+                (b, tb) = (Core::LitF(n as f64), Ty::Float64);
+            } else if coerces
+                && self.is_float(&tb)
+                && let Some(ns) = lit_prefix.take()
+            {
+                let f = |n: i64| Box::new(Core::LitF(n as f64));
+                acc = Core::LitF(ns[0] as f64);
+                for n in &ns[1..] {
+                    acc = Core::Bin(NumKind::F, bop, Box::new(acc), f(*n));
+                }
+                ty = Ty::Float64;
+            }
+            lit_prefix = match (lit_prefix.take(), lit) {
+                (Some(mut ns), Some(n)) if !self.is_float(&tb) => {
+                    ns.push(n);
+                    Some(ns)
+                }
+                _ => None,
+            };
+            if self.unify(&ty, &tb).is_err() {
+                return Err(format!(
+                    "`{op}` operands disagree: {:?} vs {:?}",
+                    self.walk(&ty),
+                    self.walk(&tb)
+                ));
+            }
+            ty = self.walk(&ty);
+            if self.checking {
+                // In checker mode no codegen; keep accumulating the type.
+                acc = Core::LitI(0);
+                continue;
+            }
+            let rt = self
+                .resolve(&ty)
+                .map_err(|_| format!("`{op}`: cannot infer operand type"))?;
+            let num = rt
+                .as_num()
+                .ok_or_else(|| format!("`{op}` expects numeric operands, got {rt:?}"))?;
+            if matches!(bop, BinOp::Mod) && !matches!(num, NumTy::I) {
+                return Err("`mod` is int64-only".to_string());
+            }
+            if matches!(bop, BinOp::Rem) && !matches!(num, NumTy::I) {
+                return Err("`remainder` is int64-only".to_string());
+            }
+            ty = rt.clone();
+            acc = Core::Bin(num.into(), bop, Box::new(acc), Box::new(b));
+        }
+        if self.checking {
+            let w = self.walk(&ty);
+            // #322: the evaluator rejects non-numeric operands at runtime;
+            // reject the KNOWN cases statically ((+ "a" "b") was `string`).
+            if Self::known_non_numeric(&w) {
+                return Err(format!(
+                    "`{op}` expects numeric operands, got {}",
+                    super::ty_name(&w)
+                ));
+            }
+            return Ok((Core::LitI(0), w));
+        }
+        Ok((acc, ty))
+    }
+
+    fn elab_cmp(
+        &self,
+        op: &str,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`{op}` expects 2 args, got {}", args.len()));
+        }
+        let (mut a, mut ta) = self.elab(&args[0], scope, max)?;
+        let (mut b, mut tb) = self.elab(&args[1], scope, max)?;
+        // Issue #530: an integer literal compared with a `float64` operand is
+        // the float constant `n as f64`, which is the evaluator's mixed-operand
+        // comparison only when the conversion is exact (issue #516: the
+        // evaluator compares exactly). Beyond 2^53 the literal stays an
+        // `int64`, the operands disagree, and the form is rejected.
+        if let Some(n) = Self::int_literal(&args[1])
+            && self.is_float(&ta)
+            && n.unsigned_abs() <= 1 << 53
+        {
+            (b, tb) = (Core::LitF(n as f64), Ty::Float64);
+        } else if let Some(n) = Self::int_literal(&args[0])
+            && self.is_float(&tb)
+            && n.unsigned_abs() <= 1 << 53
+        {
+            (a, ta) = (Core::LitF(n as f64), Ty::Float64);
+        }
+        // #476: reject before unify/resolve so no `Core::Cmp` is ever built
+        // over a boxed operand — two distinct handles can alias the same
+        // object, so comparing handle words would be silently wrong, not
+        // merely disallowed.
+        self.reject_boxed_arith_cmp(&ta)?;
+        self.reject_boxed_arith_cmp(&tb)?;
+        if self.unify(&ta, &tb).is_err() {
+            return Err(format!(
+                "`{op}` operands disagree: {:?} vs {:?}",
+                self.walk(&ta),
+                self.walk(&tb)
+            ));
+        }
+        // Checker mode: comparison is `bool`; known non-comparable operand
+        // kinds are rejected like the evaluator would at runtime (#322).
+        if self.checking {
+            let w = self.walk(&ta);
+            if Self::known_non_numeric(&w) {
+                return Err(format!(
+                    "`{op}` expects comparable (numeric or char) operands, got {}",
+                    super::ty_name(&w)
+                ));
+            }
+            return Ok((Core::LitI(0), Ty::Bool));
+        }
+        let rt = self
+            .resolve(&ta)
+            .map_err(|_| format!("`{op}`: cannot infer operand type"))?;
+        let num = rt
+            .cmp_num()
+            .ok_or_else(|| format!("`{op}` expects comparable operands, got {rt:?}"))?;
+        let cop = match op {
+            "<" => CmpOp::Lt,
+            ">" => CmpOp::Gt,
+            "<=" => CmpOp::Le,
+            ">=" => CmpOp::Ge,
+            "=" => CmpOp::Eq,
+            _ => CmpOp::Ne,
+        };
+        Ok((
+            Core::Cmp(num.into(), cop, Box::new(a), Box::new(b)),
+            Ty::Bool,
+        ))
+    }
+
+    fn elab_not(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`not` expects 1 arg, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        // In checker mode `not` follows Lisp truthiness (any operand → bool); the
+        // codegen path requires a real `bool`.
+        if !self.checking && self.unify(&ta, &Ty::Bool).is_err() {
+            return Err(format!("`not` expects bool, got {:?}", self.walk(&ta)));
+        }
+        Ok((Core::Not(Box::new(a)), Ty::Bool))
+    }
+
+    /// `AND`/`OR` are fully variadic special forms in the evaluator
+    /// (`SpecialForm::And`/`Or`, `src/evaluator/special_forms.rs`: zero or
+    /// more operands, short-circuiting left to right). This must accept any
+    /// arity — rejecting `(and a b c)` as a type error would violate the
+    /// checker's "never reject a program the interpreter runs" contract
+    /// (issue #202) even though the compileable core only has a *binary*
+    /// `Core::And`/`Or` node: 3+ operands fold right-associatively into
+    /// nested binary nodes (`(and a b c)` → `And(a, And(b, c))`), which
+    /// preserves the evaluator's short-circuit order exactly (evaluate left
+    /// to right, stop at the first falsy/truthy operand). Every operand is
+    /// required to be strictly `bool`-typed here (unlike the untyped
+    /// evaluator's "returns the actual last value" semantics), so the folded
+    /// result is that last operand's *boolean* value — observationally the
+    /// same thing, since a `bool` word is already exactly 0 or 1.
+    fn elab_logic(
+        &self,
+        op: &str,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        // Checker mode follows Lisp truthiness: `and`/`or` take any number of
+        // operands of any type and the result is one of them (heterogeneous)
+        // → `any`. Still elaborate every operand so a genuine type error
+        // nested inside one of them is reported. The codegen path below
+        // requires real `bool` operands and yields `bool`.
+        if self.checking {
+            for a in args {
+                self.elab(a, scope, max)?;
+            }
+            return Ok((Core::LitI(0), Ty::Any));
+        }
+        match args {
+            // Vacuous identity: `(and)` is truthy, `(or)` is falsy — matches
+            // the evaluator's zero-operand result (`T` / `NIL`).
+            [] => {
+                let lit = if op == "AND" { 1 } else { 0 };
+                Ok((Core::LitI(lit), Ty::Bool))
+            }
+            // A single operand's (already-bool) value passes straight
+            // through — `(and a)` and `(or a)` are both just `a`.
+            [only] => {
+                let (a, ta) = self.elab(only, scope, max)?;
+                if self.unify(&ta, &Ty::Bool).is_err() {
+                    return Err(format!(
+                        "`{op}` expects bool operands, got {:?}",
+                        self.walk(&ta)
+                    ));
+                }
+                Ok((a, Ty::Bool))
+            }
+            [first, rest @ ..] => {
+                let (a, ta) = self.elab(first, scope, max)?;
+                if self.unify(&ta, &Ty::Bool).is_err() {
+                    return Err(format!(
+                        "`{op}` expects bool operands, got {:?}",
+                        self.walk(&ta)
+                    ));
+                }
+                // Recursively fold the remainder; bottoms out at the `[only]`
+                // arm once one operand is left.
+                let (b, _tb) = self.elab_logic(op, rest, scope, max)?;
+                let node = if op == "AND" {
+                    Core::And(Box::new(a), Box::new(b))
+                } else {
+                    Core::Or(Box::new(a), Box::new(b))
+                };
+                Ok((node, Ty::Bool))
+            }
+        }
+    }
+
+    fn elab_if(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 3 {
+            return Err(format!(
+                "`if` expects (if cond then else), got {} args",
+                args.len()
+            ));
+        }
+        let (c, tc) = self.elab(&args[0], scope, max)?;
+        // Checker mode follows Lisp truthiness: any condition is allowed. The
+        // codegen path requires a real `bool`.
+        if !self.checking && self.unify(&tc, &Ty::Bool).is_err() {
+            return Err(format!(
+                "`if` condition must be bool, got {:?}",
+                self.walk(&tc)
+            ));
+        }
+        let saved = scope.len();
+        let (t, tt) = self.elab(&args[1], scope, max)?;
+        scope.truncate(saved);
+        let (e, te) = self.elab(&args[2], scope, max)?;
+        scope.truncate(saved);
+        // `nil` is also false (#505): a branch ending in `nil` meeting a
+        // `bool` branch is that boolean's false, not a heterogeneous `any`.
+        if self.nil_meets_bool(&args[1], &tt, &args[2], &te) {
+            return Ok((Core::If(Box::new(c), Box::new(t), Box::new(e)), Ty::Bool));
+        }
+        let lhs_nil = self.is_bare_nil(&args[1]);
+        let rhs_nil = self.is_bare_nil(&args[2]);
+        let result_ty =
+            self.join_branch_types(lhs_nil, &tt, rhs_nil, &te, "`if` branches disagree")?;
+        Ok((Core::If(Box::new(c), Box::new(t), Box::new(e)), result_ty))
+    }
+
+    /// Does a checker-mode branch/clause *source expression* look like a
+    /// bare `nil`/`()` literal (as opposed to a computed value that merely
+    /// happens to type as a list)? Meaningless outside `self.checking`
+    /// (codegen never elaborates a literal `LispVal::Nil` — see the `elab`
+    /// match arm). Used by [`Cx::join_branch_types`] (#336).
+    fn is_bare_nil(&self, expr: &LispVal) -> bool {
+        self.checking && matches!(expr, LispVal::Nil)
+    }
+
+    /// Does a checker-mode branch/clause yield a bare `nil` literal — the
+    /// literal itself, or the tail of a `progn` (#505)?
+    fn ends_in_bare_nil(&self, expr: &LispVal) -> bool {
+        if self.is_bare_nil(expr) {
+            return true;
+        }
+        let items = list_to_vec(expr);
+        match items.first() {
+            Some(LispVal::Symbol(s)) if s.borrow().name == "PROGN" && items.len() > 1 => {
+                self.ends_in_bare_nil(&items[items.len() - 1])
+            }
+            _ => false,
+        }
+    }
+
+    /// Is this `if` a `bool` branch against a branch ending in `nil` (#505)?
+    fn nil_meets_bool(&self, lhs: &LispVal, lty: &Ty, rhs: &LispVal, rty: &Ty) -> bool {
+        (self.ends_in_bare_nil(lhs) && matches!(self.walk(rty), Ty::Bool))
+            || (self.ends_in_bare_nil(rhs) && matches!(self.walk(lty), Ty::Bool))
+    }
+
+    /// Join the two branch result types of an `if` (#336 — the
+    /// nil-on-miss honesty rule (lib/28-types.lisp rule 1) extended to the
+    /// checker's on-demand DERIVED path, not just the declared layer).
+    ///
+    /// A bare `nil`/`()` literal types as `(list _)` — an empty list of
+    /// unknown element type (see the `LispVal::Nil` arm of `elab`) — purely
+    /// so that a nil branch meeting a genuine list branch still unifies as
+    /// a list (e.g. `(if p (list 1 2) nil)` stays `(list int64)`, exactly
+    /// as before this change). But when a literal-nil branch meets a
+    /// branch that is NOT itself a list — a ground scalar, or a still-free
+    /// type variable nothing has pinned to anything concrete yet — forcing
+    /// that unification either hard-errors (the guard idiom,
+    /// `(if (numberp n) n 10)`, where `n` flowed from a nil-on-miss
+    /// function) or silently commits the other branch's free variable to
+    /// "list of something" (`(if t x nil)` deriving `x`'s own parameter as
+    /// `(list a)`). Both outcomes are exactly the bias the declared-layer
+    /// honesty rule forbids. Mirror that rule here: such a join degrades
+    /// the whole `if` to `any` (heterogeneous — the same call
+    /// `elab_when` already makes for its implicit nil branch) instead of
+    /// unifying or erroring. Two branches that are both nil, both
+    /// non-nil, or one nil meeting an already-list-or-`any` branch are
+    /// untouched — they fall through to the ordinary `unify`, so a
+    /// genuine type conflict between two concrete branches still errors.
+    fn join_branch_types(
+        &self,
+        lhs_nil: bool,
+        lty: &Ty,
+        rhs_nil: bool,
+        rty: &Ty,
+        disagreement: &str,
+    ) -> Result<Ty, String> {
+        if lhs_nil != rhs_nil {
+            let other = self.walk(if lhs_nil { rty } else { lty });
+            if !matches!(other, Ty::List(_) | Ty::Any) {
+                return Ok(Ty::Any);
+            }
+        }
+        if self.unify(lty, rty).is_err() {
+            return Err(format!(
+                "{disagreement}: {:?} vs {:?}",
+                self.walk(lty),
+                self.walk(rty)
+            ));
+        }
+        // An `any` branch makes the join `any` whichever side it is on
+        // (#505): `unify` absorbs it without binding, so returning the other
+        // side would let the gradual branch vanish (`(if p nil (eval x))`
+        // typing as `(list a)`).
+        if matches!(self.walk(rty), Ty::Any) {
+            return Ok(Ty::Any);
+        }
+        Ok(self.walk(lty))
+    }
+
+    /// `stmt`: the `let`'s value is discarded, so its last body form is
+    /// elaborated in statement mode too (#513) — see [`Self::elab_stmt`].
+    fn elab_let(
+        &self,
+        args: &[LispVal],
+        stmt: bool,
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let bindings = args
+            .first()
+            .map(list_to_vec)
+            .ok_or_else(|| "`let-typed` needs a binding list".to_string())?;
+        let body = &args[1..];
+        if body.is_empty() {
+            return Err("`let-typed` needs a body".to_string());
+        }
+        let saved = scope.len();
+        let mut writes: Vec<(usize, Core, Ty)> = Vec::with_capacity(bindings.len());
+        for b in &bindings {
+            let parts = list_to_vec(b);
+            // Two binding shapes: `(name type init)` pins the type explicitly,
+            // `(name init)` leaves it to be inferred from the initializer
+            // (issue #135 — the one surface-compatible inferable position).
+            let (name, declared, init) = match parts.as_slice() {
+                [LispVal::Symbol(n), declared_ty, init] => {
+                    let mut infer = self.infer.borrow_mut();
+                    let ty = parse_ty(declared_ty, &mut infer, self.structs)
+                        .map_err(|e| format!("binding `{}`: {e}", n.borrow().name))?;
+                    (n.borrow().name.clone(), Some(ty), init)
+                }
+                [LispVal::Symbol(n), init] => (n.borrow().name.clone(), None, init),
+                _ => {
+                    return Err(
+                        "`let-typed` binding must be (name type init) or (name init)".to_string(),
+                    );
+                }
+            };
+            let (init_core, init_ty) = self.elab(init, scope, max)?;
+            // An explicit annotation is a principal-type pin: unify it with the
+            // inferred initializer type (must agree). Omitting it makes a fresh
+            // variable that the initializer constrains — the inference path.
+            let ty = match declared {
+                Some(d) => {
+                    if self.unify(&d, &init_ty).is_err() {
+                        return Err(format!(
+                            "binding `{name}` declared {d:?} but init is {:?}",
+                            self.walk(&init_ty)
+                        ));
+                    }
+                    d
+                }
+                None => {
+                    // A fresh variable constrained by the initializer. It is NOT
+                    // resolved here: an array binding's element type is only fixed
+                    // by later `store`/`fetch` in the body, so resolution is
+                    // deferred (the var flows via `walk` to every reference).
+                    let v = self.fresh();
+                    self.unify(&v, &init_ty)
+                        .expect("fresh variable always unifies");
+                    v
+                }
+            };
+            let slot = scope.len();
+            scope.push((name, ty.clone()));
+            *max = (*max).max(scope.len());
+            writes.push((slot, init_core, ty));
+        }
+        let (mut body_core, body_ty) = self.elab_body_mode(body, stmt, scope, max)?;
+        // Array-of-structs inline layout (jit/core-loops follow-up): for each
+        // binding in this `let` whose (now fully-constrained-by-the-body)
+        // type is a scalar-fields struct array, try to fuse its uses in
+        // `body_core` into the stride-based primitives. Purely a layout
+        // optimization — `try_stride_binding` leaves both cores unchanged
+        // whenever it can't prove every use safe (see `stride_walk`).
+        // Pre-compute which slots are referenced in later sibling inits,
+        // so the stride rewrite refuses to fuse when a sibling's init would
+        // read the array under the old (non-stride) layout.
+        let sibling_unsafe: Vec<bool> = (0..writes.len())
+            .map(|idx| {
+                let slot = writes[idx].0;
+                writes[idx + 1..]
+                    .iter()
+                    .any(|(_, sib_init, _)| core_references_slot(sib_init, slot))
+            })
+            .collect();
+        for (idx, (slot, init_core, ty)) in writes.iter_mut().enumerate() {
+            if sibling_unsafe[idx] {
+                continue;
+            }
+            let taken = std::mem::replace(init_core, Core::LitI(0));
+            let (new_init, new_body) = self.try_stride_binding(*slot, ty, taken, body_core);
+            *init_core = new_init;
+            body_core = new_body;
+        }
+        scope.truncate(saved);
+        let mut acc = body_core;
+        for (slot, init_core, _ty) in writes.into_iter().rev() {
+            acc = Core::Let(slot, Box::new(init_core), Box::new(acc));
+        }
+        Ok((acc, body_ty))
+    }
+
+    /// Try to fuse a `let`-bound `(array Struct)` local (`slot`, of type
+    /// `ty`, initialized by `init_core`) into the inline (contiguous
+    /// array-of-structs) layout for `body_core` (jit/core-loops array-of-
+    /// structs follow-up). Returns `(init_core, body_core)` unchanged unless
+    /// ALL of the following hold, in which case it returns the rewritten
+    /// pair:
+    /// - `ty` (after [`Cx::resolve`], now that `body_core`'s own unifications
+    ///   have run) resolves to `Ty::Array(Ty::Struct(def))`;
+    /// - `def`'s fields are all scalar ([`StructDef::stride`] is `Some`);
+    /// - `init_core` is exactly `Core::ArrayNew(_)` — the ordinary `(array
+    ///   n)`/`(make-array n)` allocator, so upgrading it to
+    ///   `Core::ArrayNewStride` is a pure allocation-strategy swap;
+    /// - the struct's `MAKE-<Name>` constructor is a registered function
+    ///   (always true for a `defstruct-typed`-declared struct);
+    /// - every reachable use of `slot` in `body_core` matches a pattern
+    ///   [`stride_walk`] recognizes as safe under the inline layout.
+    fn try_stride_binding(
+        &self,
+        slot: usize,
+        ty: &Ty,
+        init_core: Core,
+        body_core: Core,
+    ) -> (Core, Core) {
+        // `walk` only resolves the *outer* variable, not a compound type's
+        // nested component (`Ty::Array`'s element) — `resolve` recurses, so
+        // it is the one that can actually observe "the element type turned
+        // out to be a struct" here. It is safe to call now (not just at the
+        // whole function's final signature resolve): `arr`'s element type
+        // can only ever be constrained by a `fetch`/`store` reached from
+        // THIS let's own `body`, since the binding is lexically scoped to
+        // it — every such constraint has already landed by the time
+        // `elab_body` returned. An `Err` here just means some other part of
+        // `body` never pinned it down (e.g. an unused/never-indexed array);
+        // leave the binding as the general layout, exactly as the final
+        // whole-function resolve would separately reject or accept it.
+        let Ok(resolved) = self.resolve(ty) else {
+            return (init_core, body_core);
+        };
+        let elem_def = match &resolved {
+            Ty::Array(elem) => match elem.as_ref() {
+                Ty::Struct(def) => def.clone(),
+                _ => return (init_core, body_core),
+            },
+            _ => return (init_core, body_core),
+        };
+        let n = match &init_core {
+            Core::ArrayNew(n) => n.clone(),
+            _ => return (init_core, body_core),
+        };
+        let Some(stride) = elem_def.stride() else {
+            return (init_core, body_core);
+        };
+        let Some(&ctor_id) = self.by_name.get(&format!("MAKE-{}", elem_def.name)) else {
+            return (init_core, body_core);
+        };
+        let mut getters = HashMap::new();
+        let mut setters = HashMap::new();
+        for (i, (fname, _)) in elem_def.fields.iter().enumerate() {
+            if let Some(&id) = self.by_name.get(&format!("{}-{fname}", elem_def.name)) {
+                getters.insert(id, i);
+            }
+            if let Some(&id) = self.by_name.get(&format!("SET-{}-{fname}", elem_def.name)) {
+                setters.insert(id, i);
+            }
+        }
+        let sc = StrideCtx {
+            slot,
+            stride,
+            ctor_id,
+            getters,
+            setters,
+        };
+        match stride_walk(&body_core, &sc, false) {
+            Ok(new_body) => (Core::ArrayNewStride(n, stride), new_body),
+            Err(()) => (init_core, body_core),
+        }
+    }
+
+    /// `(setq var val)` on a local slot (param or `let`-binding): store the
+    /// value word into the slot and evaluate to the stored word. `setq` on
+    /// anything else (a dynamic/global) is not local and stays in the
+    /// tree-walker — the whole function falls back to interpreted rather than
+    /// misroute a dynamic assignment through a nonexistent slot.
+    fn elab_setq(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err("setq in typed code takes exactly 2 arguments".to_string());
+        }
+        let name = match &args[0] {
+            LispVal::Symbol(s) => s.borrow().name.clone(),
+            _ => return Err("setq: first argument must be a symbol".to_string()),
+        };
+        let slot = scope.iter().rposition(|(n, _)| *n == name).ok_or_else(|| {
+            format!("setq: variable {name} is not a local binding (only local setq is compileable)")
+        })?;
+        let slot_ty = scope[slot].1.clone();
+        let (val_core, val_ty) = self.elab(&args[1], scope, max)?;
+        self.unify(&slot_ty, &val_ty)
+            .map_err(|e| format!("setq {name}: type mismatch: {e}"))?;
+        Ok((Core::Assign(slot, Box::new(val_core)), val_ty))
+    }
+
+    /// `(while test body...)`: evaluate TEST; while truthy, evaluate BODY for
+    /// side effects, then loop. Always evaluates to `0`, typed `bool`: native
+    /// code carries NIL as `false`, so a loop in value position yields NIL
+    /// exactly as the tree-walker does (#524), and a use of it as a number
+    /// fails to unify, leaving the function interpreted.
+    fn elab_while(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() < 2 {
+            return Err("while requires a test and at least one body form".to_string());
+        }
+        let (test_core, test_ty) = self.elab(&args[0], scope, max)?;
+        // The test may be a comparison (bool) or a plain int64 truthy/falsy
+        // value; accept either.
+        if self.unify(&test_ty, &Ty::Bool).is_err() {
+            self.unify(&test_ty, &Ty::Int64)
+                .map_err(|_| "while: test must be bool or int64".to_string())?;
+        }
+        let body_core = self.elab_loop_body(&args[1..], scope, max)?;
+        Ok((
+            Core::While(Box::new(test_core), Box::new(body_core)),
+            Ty::Bool,
+        ))
+    }
+
+    /// `(for (var start end [step]) body...)`: evaluate START/END/STEP once,
+    /// in the OUTER scope (the loop variable is not yet bound — matches the
+    /// tree-walker, `special_forms.rs::eval_for`), then bind VAR to a fresh
+    /// slot and iterate it from START to END inclusive by STEP (default 1).
+    /// Always evaluates to `0`, typed `bool` (NIL) for the same reason as
+    /// `while`.
+    fn elab_for(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() < 2 {
+            return Err("for requires a spec list (var start end [step]) and a body".to_string());
+        }
+        let spec = list_to_vec(&args[0]);
+        if spec.len() != 3 && spec.len() != 4 {
+            return Err("for spec must be (var start end [step])".to_string());
+        }
+        let var_name = match &spec[0] {
+            LispVal::Symbol(s) => s.borrow().name.clone(),
+            _ => return Err("for: loop variable must be a symbol".to_string()),
+        };
+
+        let (start_core, start_ty) = self.elab(&spec[1], scope, max)?;
+        self.unify(&start_ty, &Ty::Int64)
+            .map_err(|_| "for: start must be int64".to_string())?;
+        let (end_core, end_ty) = self.elab(&spec[2], scope, max)?;
+        self.unify(&end_ty, &Ty::Int64)
+            .map_err(|_| "for: end must be int64".to_string())?;
+        let step_core = if spec.len() == 4 {
+            let (step_core, step_ty) = self.elab(&spec[3], scope, max)?;
+            self.unify(&step_ty, &Ty::Int64)
+                .map_err(|_| "for: step must be int64".to_string())?;
+            step_core
+        } else {
+            Core::LitI(1)
+        };
+
+        let saved = scope.len();
+        let slot = scope.len();
+        scope.push((var_name, Ty::Int64));
+        *max = (*max).max(scope.len());
+        let body_core = self.elab_loop_body(&args[1..], scope, max)?;
+        scope.truncate(saved);
+
+        Ok((
+            Core::For {
+                slot,
+                start: Box::new(start_core),
+                end: Box::new(end_core),
+                step: Box::new(step_core),
+                body: Box::new(body_core),
+            },
+            Ty::Bool,
+        ))
+    }
+
+    /// `(dotimes (var count [result]) body...)`, desugared to the same shape
+    /// lib/12-control.lisp's macro expands to:
+    /// `(let ((%n count)) (for (var 0 (- %n 1)) body...) [(let ((var %n)) result)])`.
+    /// The count temp is un-interned and named so user code cannot capture it.
+    fn elab_dotimes(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let spec = args.first().map(list_to_vec).unwrap_or_default();
+        if spec.len() != 2 && spec.len() != 3 {
+            return Err("dotimes spec must be (var count [result])".to_string());
+        }
+        let var = spec[0].clone();
+        let n = synth_symbol("%DOTIMES-COUNT");
+        let limit = LispVal::list(vec![synth_symbol("-"), n.clone(), LispVal::Number(1)]);
+        let mut for_form = vec![
+            synth_symbol("FOR"),
+            LispVal::list(vec![var.clone(), LispVal::Number(0), limit]),
+        ];
+        for_form.extend(args[1..].iter().cloned());
+        let mut let_form = vec![
+            synth_symbol("LET"),
+            LispVal::list(vec![LispVal::list(vec![n.clone(), spec[1].clone()])]),
+            LispVal::list(for_form),
+        ];
+        if let Some(result) = spec.get(2) {
+            let_form.push(LispVal::list(vec![
+                synth_symbol("LET"),
+                LispVal::list(vec![LispVal::list(vec![var, n])]),
+                result.clone(),
+            ]));
+        }
+        self.elab(&LispVal::list(let_form), scope, max)
+    }
+
+    /// `(append l1 ... ln)` : every argument `(list a)`, result `(list a)`.
+    /// (Dotted-tail append is dynamically legal but rejected in checked
+    /// code — checked code keeps lists regular.)
+    fn elab_append(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let elem = self.fresh();
+        let want = Ty::List(Box::new(elem));
+        for a in args {
+            let (_, ta) = self.elab(a, scope, max)?;
+            self.unify(&ta, &want)
+                .map_err(|e| format!("`append`: {e}"))?;
+        }
+        Ok((Core::LitI(0), self.walk(&want)))
+    }
+
+    /// A variadic operator whose arguments and result share one known
+    /// monomorphic type (concat over strings; bitwise/gcd over int64).
+    fn elab_mono_variadic(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+        ty: Ty,
+        what: &str,
+    ) -> Result<(Core, Ty), String> {
+        for a in args {
+            let (_, ta) = self.elab(a, scope, max)?;
+            self.unify(&ta, &ty).map_err(|e| format!("`{what}`: {e}"))?;
+        }
+        Ok((Core::LitI(0), ty))
+    }
+
+    /// `(min a b ...)` / `(max ...)`: a numeric chain like `+`.
+    fn elab_min_max(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.is_empty() {
+            return Err("`min`/`max` require at least one argument".to_string());
+        }
+        let (_, mut ty) = self.elab(&args[0], scope, max)?;
+        self.reject_boxed_arith_cmp(&ty)?;
+        for a in &args[1..] {
+            let (_, tb) = self.elab(a, scope, max)?;
+            self.reject_boxed_arith_cmp(&tb)?;
+            self.unify(&ty, &tb)
+                .map_err(|e| format!("`min`/`max`: {e}"))?;
+            ty = self.walk(&ty);
+        }
+        let w = self.walk(&ty);
+        if Self::known_non_numeric(&w) {
+            return Err(format!(
+                "`min`/`max` expect numeric operands, got {}",
+                super::ty_name(&w)
+            ));
+        }
+        Ok((Core::LitI(0), w))
+    }
+
+    /// Does an argument's WALKED type structurally match an instance
+    /// scheme's first-parameter shape? (Selection only — real unification
+    /// follows once an instance is chosen.)
+    fn instance_shape_matches(param: &Ty, arg: &Ty) -> bool {
+        match (param, arg) {
+            (Ty::List(_), Ty::List(_))
+            | (Ty::Str, Ty::Str)
+            | (Ty::Array(_), Ty::Array(_))
+            | (Ty::Pair(_, _), Ty::Pair(_, _))
+            | (Ty::Int64, Ty::Int64)
+            | (Ty::Float64, Ty::Float64)
+            | (Ty::Bool, Ty::Bool)
+            | (Ty::Char, Ty::Char)
+            | (Ty::Symbol, Ty::Symbol)
+            | (Ty::Record(_, _), Ty::Record(_, _)) => true,
+            (Ty::Struct(p), Ty::Struct(a)) => p.name == a.name,
+            (Ty::App(p, _), Ty::App(a, _)) => {
+                p.name == a.name || a.variant.as_deref() == Some(p.name.as_str())
+            }
+            (Ty::Variant(p), Ty::Variant(a)) => p.name == a.name,
+            (Ty::Variant(p), Ty::Struct(a)) => p.ctors.iter().any(|c| *c == a.name),
+            _ => false,
+        }
+    }
+
+    /// Elaborate a call to a protocol name: select the instance whose
+    /// dispatch-position parameter shape matches the corresponding
+    /// argument, then unify all arguments against the instantiated
+    /// instance scheme. Fn-first protocols (`map`) dispatch on 1.
+    fn elab_protocol_call(
+        &self,
+        name: &str,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let instances = &self.protocols[name];
+        let d = self.protocol_dispatch.get(name).copied().unwrap_or(0);
+        if args.len() <= d {
+            return Err(format!(
+                "`{name}`: protocol calls need at least {} arguments",
+                d + 1
+            ));
+        }
+        let arg_tys: Vec<Ty> = args
+            .iter()
+            .map(|a| self.elab(a, scope, max).map(|(_, t)| t))
+            .collect::<Result<_, _>>()?;
+        let w = self.walk(&arg_tys[d]);
+        // Unresolved dispatch argument: gradual — but when every instance
+        // agrees on one GROUND result type, the result is still known.
+        if matches!(w, Ty::Var(_) | Ty::Any) {
+            let mut shared: Option<Ty> = None;
+            for inst in instances {
+                if let Ty::Fn(_, ret) = &inst.ty {
+                    let r = ret.as_ref();
+                    let ground = !matches!(r, Ty::Var(_));
+                    match (&shared, ground) {
+                        (None, true) => shared = Some(r.clone()),
+                        (Some(prev), true) if prev == r => {}
+                        _ => return Ok((Core::LitI(0), Ty::Any)),
+                    }
+                }
+            }
+            return Ok((Core::LitI(0), shared.unwrap_or(Ty::Any)));
+        }
+        // Resolved: select by shape, then unify against the instance.
+        for inst in instances {
+            let shape_ok = match &inst.ty {
+                Ty::Fn(ps, _) if ps.len() > d => Self::instance_shape_matches(&ps[d], &w),
+                _ => false,
+            };
+            if !shape_ok {
+                continue;
+            }
+            let ty = self.infer.borrow_mut().instantiate(inst);
+            let Ty::Fn(ps, ret) = ty else { continue };
+            if ps.len() != args.len() {
+                return Err(format!(
+                    "`{name}`: this instance expects {} args, got {}",
+                    ps.len(),
+                    args.len()
+                ));
+            }
+            for (at, p) in arg_tys.iter().zip(ps.iter()) {
+                self.unify(at, p)
+                    .map_err(|e| format!("in call to `{name}`: {e}"))?;
+            }
+            return Ok((Core::LitI(0), *ret));
+        }
+        Err(format!("no `{name}` instance for {}", super::ty_name(&w)))
+    }
+
+    /// The derived-scheme path for an unknown callee (#308). Returns
+    /// `Ok(None)` when nothing can be derived (the caller stays gradual).
+    fn derived_call(
+        &self,
+        name: &str,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<Option<(Core, Ty)>, String> {
+        // A callee currently being checked up-stack: use its in-flight
+        // monotype arrow (standard monomorphic-recursion assumption).
+        let assumed = self.assumptions.borrow().get(name).cloned();
+        if let Some(Ty::Fn(ps, ret)) = assumed {
+            if ps.len() != args.len() {
+                return Ok(None);
+            }
+            for (a, p) in args.iter().zip(ps.iter()) {
+                let (_, at) = self.elab(a, scope, max)?;
+                self.unify(&at, p)
+                    .map_err(|e| format!("in call to `{name}`: {e}"))?;
+            }
+            return Ok(Some((Core::LitI(0), self.walk(&ret))));
+        }
+        let memo = self.derived.borrow().get(name).cloned();
+        let scheme = match memo {
+            Some(cached) => cached,
+            None => {
+                let Some(resolver) = self.resolver else {
+                    return Ok(None);
+                };
+                let derived = match resolver(name) {
+                    Some((params, body)) => self.check_callee(name, &params, &body).ok(),
+                    None => None,
+                };
+                self.derived
+                    .borrow_mut()
+                    .insert(name.to_string(), derived.clone());
+                derived
+            }
+        };
+        let Some(scheme) = scheme else {
+            return Ok(None);
+        };
+        let inst = self.infer.borrow_mut().instantiate(&scheme);
+        match inst {
+            Ty::Fn(ps, ret) => {
+                if ps.len() != args.len() {
+                    return Err(format!(
+                        "`{name}` expects {} args, got {} (inferred type)",
+                        ps.len(),
+                        args.len()
+                    ));
+                }
+                for (a, p) in args.iter().zip(ps.iter()) {
+                    let (_, at) = self.elab(a, scope, max)?;
+                    self.unify(&at, p)
+                        .map_err(|e| format!("in call to `{name}`: {e}"))?;
+                }
+                Ok(Some((Core::LitI(0), *ret)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Check a callee's own body inside this run and return its generalized
+    /// scheme. The callee's fresh variables join `avoid_gen` for the duration
+    /// (so deeper callees don't quantify them), and its arrow is generalized
+    /// avoiding every *enclosing* in-flight variable.
+    fn check_callee(
+        &self,
+        name: &str,
+        params: &[String],
+        body: &[LispVal],
+    ) -> Result<infer::Scheme, String> {
+        if body.is_empty() {
+            return Err("empty body".to_string());
+        }
+        let ptys: Vec<Ty> = params.iter().map(|_| self.fresh()).collect();
+        let ret = self.fresh();
+        let own_vars: Vec<u32> = ptys
+            .iter()
+            .chain(std::iter::once(&ret))
+            .filter_map(|t| match t {
+                Ty::Var(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        let arrow = Ty::Fn(ptys.clone(), Box::new(ret.clone()));
+        self.assumptions
+            .borrow_mut()
+            .insert(name.to_string(), arrow.clone());
+        self.avoid_gen.borrow_mut().extend(own_vars.iter().copied());
+        let mut scope: Scope = params.iter().cloned().zip(ptys).collect();
+        let mut max = scope.len();
+        let outcome = self
+            .elab_body(body, &mut scope, &mut max)
+            .and_then(|(_, bt)| {
+                let wbt = self.walk(&bt);
+                // #336: for a SELF-RECURSIVE callee, a recursive call site
+                // unifies against `ret` *while the body is still being
+                // elaborated* — an ordinary sibling clause can concretize
+                // `ret` before the body's OWN top-level honesty-rule join
+                // (an outer nil-vs-non-list `if`, see `join_branch_types`)
+                // gets to decide the honest answer is `any`. When that
+                // happens, `bt` (the body's final, authoritative type) is
+                // `any` even though `ret` already got pinned to something
+                // concrete along the way; `unify(any, ret)` alone cannot
+                // undo that (`any` only absorbs a *still-free* variable).
+                // Trust `bt` and force `ret` back to `any` rather than let
+                // the internal concretization leak into the generalized
+                // scheme.
+                // #505: the same holds when `ret` is still free — `unify(any,
+                // ret)` would leave it free and generalization would turn the
+                // gradual `any` into a `∀` any caller could instantiate.
+                if matches!(wbt, Ty::Any) {
+                    if let Ty::Var(id) = &ret {
+                        self.infer.borrow_mut().force_any(*id);
+                    }
+                    Ok(())
+                } else {
+                    self.unify(&bt, &ret)
+                        .map_err(|_| "return type mismatch across branches".to_string())
+                }
+            });
+        self.assumptions.borrow_mut().remove(name);
+        {
+            let mut avoid = self.avoid_gen.borrow_mut();
+            avoid.retain(|v| !own_vars.contains(v));
+        }
+        outcome?;
+        let inf = self.infer.borrow();
+        Ok(inf.generalize_avoiding(&arrow, &self.avoid_gen.borrow()))
+    }
+
+    fn elab_call(
+        &self,
+        name: &str,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let id = match self.by_name.get(name) {
+            Some(id) => *id,
+            // A typed PROTOCOL (0.3): several instance schemes, selected by
+            // the first argument's inferred shape. A resolved argument with
+            // no matching instance is the census's promised misuse error;
+            // an unresolved argument falls back to the shared result type
+            // when the instances agree on one, else Any.
+            None if self.checking && self.protocols.contains_key(name) => {
+                return self.elab_protocol_call(name, args, scope, max);
+            }
+            // A **declared** scheme (experimental rows): the Lisp layer asserted
+            // this callee's type (e.g. a row-polymorphic concept accessor), so
+            // instantiate it, demand it of the arguments, and yield its result
+            // type. Checker-only: codegen still rejects unknown calls.
+            None if self.checking && self.declared.contains_key(name) => {
+                let inst = {
+                    let mut inf = self.infer.borrow_mut();
+                    inf.instantiate(&self.declared[name])
+                };
+                match inst {
+                    Ty::Fn(ps, ret) => {
+                        if ps.len() != args.len() {
+                            return Err(format!(
+                                "`{name}` expects {} args, got {} (declared type)",
+                                ps.len(),
+                                args.len()
+                            ));
+                        }
+                        for (a, p) in args.iter().zip(ps.iter()) {
+                            let (_, at) = self.elab(a, scope, max)?;
+                            self.unify(&at, p)
+                                .map_err(|e| format!("in call to `{name}`: {e}"))?;
+                        }
+                        return Ok((Core::LitI(0), *ret));
+                    }
+                    // A declared non-arrow type says nothing useful about a
+                    // call; stay gradual.
+                    _ => {
+                        for a in args {
+                            self.elab(a, scope, max)?;
+                        }
+                        return Ok((Core::LitI(0), Ty::Any));
+                    }
+                }
+            }
+            // Derived schemes (#308): before conceding the gradual frontier,
+            // try to derive the callee's own scheme — a recursion assumption,
+            // a memoized result, or an on-demand check of its lambda body via
+            // the resolver. This is what lets row types flow through helper
+            // functions with no declare-type! axioms.
+            None if self.checking => {
+                if let Some(res) = self.derived_call(name, args, scope, max)? {
+                    return Ok(res);
+                }
+                // Gradual frontier (#162): an unknown/untyped callee yields
+                // `Any`. We still elaborate the arguments so type errors
+                // *inside* them surface, but leave them unconstrained (the
+                // callee makes no demand). The codegen path keeps rejecting
+                // unknown calls.
+                for a in args {
+                    self.elab(a, scope, max)?;
+                }
+                return Ok((Core::LitI(0), Ty::Any));
+            }
+            // FUNCALL/APPLY are higher-order; they can't be compiled to native code
+            // because the callee is a runtime value with no static type. Bounce the
+            // call: elaborate args so inner type errors surface, yield Any. In
+            // codegen mode the containing defun-typed will fail to resolve Any to a
+            // concrete return type — use an untyped defun wrapper instead.
+            None if matches!(name, "FUNCALL" | "APPLY") => {
+                for a in args {
+                    self.elab(a, scope, max)?;
+                }
+                return Ok((Core::LitI(0), Ty::Any));
+            }
+            // A builtin the checker types but codegen has no lowering for is
+            // not an unknown function (#512): say what it is.
+            None if checking_only_builtin(name) => {
+                return Err(format!(
+                    "builtin `{name}` is not supported in compiled code"
+                ));
+            }
+            None => return Err(format!("call to unknown function `{name}`")),
+        };
+        let callee = &self.funcs[id];
+        let params = callee.params.borrow().clone();
+        let ret = callee.ret.borrow().clone();
+        if args.len() != params.len() {
+            return Err(format!(
+                "`{name}` expects {} args, got {}",
+                params.len(),
+                args.len()
+            ));
+        }
+        let mut arg_cores = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let (ac, at) = self.elab(a, scope, max)?;
+            if self.unify(&at, &params[i].1).is_err() {
+                return Err(format!(
+                    "`{name}` arg {i} expects {}, got {}",
+                    ty_name(&params[i].1),
+                    ty_name(&self.walk(&at))
+                ));
+            }
+            arg_cores.push(ac);
+        }
+        Ok((Core::Call(id, arg_cores), ret))
+    }
+
+    /// `(char-code c)` : char -> int64. Widening: the char word already holds
+    /// the byte value, so the core is reused unchanged, only its type changes.
+    fn elab_char_code(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`char-code` expects 1 arg, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        // The evaluator's CHAR-CODE (`src/evaluator/builtins_core.rs`) accepts
+        // a char *or* any non-empty string (the first char's code point). In
+        // checker mode (`check-type`) that generosity must be preserved so the
+        // checker never rejects a program the interpreter would run (#202,
+        // #281): also accept a string / `(array char)` operand. In codegen
+        // mode only a scalar `char` lowers to an unboxed word (a boxed
+        // `LispVal::String`/array is not a scalar char), so the strict
+        // char-only requirement stays there.
+        if self.checking {
+            let w = self.walk(&ta);
+            let accepts = match &w {
+                Ty::Char | Ty::Str | Ty::Any => true,
+                Ty::Array(e) => matches!(**e, Ty::Char | Ty::Any | Ty::Var(_)),
+                // An unconstrained variable defaults to char, as before.
+                Ty::Var(_) => self.unify(&ta, &Ty::Char).is_ok(),
+                _ => false,
+            };
+            if !accepts {
+                return Err(format!(
+                    "`char-code` expects char or string, got {:?}",
+                    self.walk(&ta)
+                ));
+            }
+            return Ok((a, Ty::Int64));
+        }
+        if self.unify(&ta, &Ty::Char).is_err() {
+            return Err(format!(
+                "`char-code` expects char, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        Ok((a, Ty::Int64))
+    }
+
+    /// `(code-char n)` : int64 -> char. Narrowing: mask the word to a byte.
+    fn elab_code_char(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`code-char` expects 1 arg, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        if self.unify(&ta, &Ty::Int64).is_err() {
+            return Err(format!(
+                "`code-char` expects int64, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        Ok((Core::ToChar(Box::new(a)), Ty::Char))
+    }
+
+    /// `(array n)` / `(make-array n)` : int64 -> (array α). The element type is a
+    /// fresh variable, unified at each `fetch`/`store` site and resolved before
+    /// codegen (#137/#138 — element types are inferred, never annotated here).
+    fn elab_array_new(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`array` expects 1 arg (size), got {}", args.len()));
+        }
+        let (n, tn) = self.elab(&args[0], scope, max)?;
+        if self.unify(&tn, &Ty::Int64).is_err() {
+            return Err(format!(
+                "`array` size must be int64, got {:?}",
+                self.walk(&tn)
+            ));
+        }
+        let elem = self.fresh();
+        Ok((Core::ArrayNew(Box::new(n)), Ty::Array(Box::new(elem))))
+    }
+
+    /// `(fetch a i)` : (array α) int64 -> α. Bounds-checked at runtime.
+    ///
+    /// Issue #476: at a BOXED receiver, `a` is a handle to a general
+    /// `LispVal::Array` (not the flat arena buffer this function otherwise
+    /// indexes) — dispatches to [`Core::BoxedOp`]`(`[`BoxedOp::Aref`]`)`
+    /// instead, per §1(a): the array crosses the boundary as one handle
+    /// word, so indexing it is itself an intrinsic, never a
+    /// materialize-then-`Core::ArrayGet` desugaring.
+    fn elab_fetch(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`fetch` expects 2 args, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        let (i, ti) = self.elab(&args[1], scope, max)?;
+        if matches!(self.walk(&ta), Ty::Boxed) {
+            if self.unify(&ti, &Ty::Int64).is_err() {
+                return Err(format!(
+                    "`fetch` index must be int64, got {:?}",
+                    self.walk(&ti)
+                ));
+            }
+            return Ok((Core::BoxedOp(BoxedOp::Aref, vec![a, i]), Ty::Boxed));
+        }
+        let elem = self.fresh();
+        if self.unify(&ta, &Ty::Array(Box::new(elem.clone()))).is_err() {
+            return Err(format!(
+                "`fetch` expects an array, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        if self.unify(&ti, &Ty::Int64).is_err() {
+            return Err(format!(
+                "`fetch` index must be int64, got {:?}",
+                self.walk(&ti)
+            ));
+        }
+        let rt = self.walk(&elem);
+        Ok((Core::ArrayGet(Box::new(a), Box::new(i)), rt))
+    }
+
+    /// `(store a i v)` : (array α) int64 α -> α. Evaluates to the stored value.
+    ///
+    /// Issue #476: at a BOXED receiver, dispatches to
+    /// [`Core::BoxedOp`]`(`[`BoxedOp::Aset`]`)` — see [`Self::elab_fetch`]'s
+    /// doc comment for why. `v` must itself be boxed (no silent int/float
+    /// auto-boxing: `boxed` is never inferred, only where a signature writes
+    /// it).
+    fn elab_store(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 3 {
+            return Err(format!("`store` expects 3 args, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        let (i, ti) = self.elab(&args[1], scope, max)?;
+        let (v, tv) = self.elab(&args[2], scope, max)?;
+        if matches!(self.walk(&ta), Ty::Boxed) {
+            if self.unify(&ti, &Ty::Int64).is_err() {
+                return Err(format!(
+                    "`store` index must be int64, got {:?}",
+                    self.walk(&ti)
+                ));
+            }
+            if self.unify(&tv, &Ty::Boxed).is_err() {
+                return Err(format!(
+                    "`store` value type {:?} does not match element type boxed",
+                    self.walk(&tv)
+                ));
+            }
+            return Ok((Core::BoxedOp(BoxedOp::Aset, vec![a, i, v]), Ty::Boxed));
+        }
+        let elem = self.fresh();
+        if self.unify(&ta, &Ty::Array(Box::new(elem.clone()))).is_err() {
+            return Err(format!(
+                "`store` expects an array, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        if self.unify(&ti, &Ty::Int64).is_err() {
+            return Err(format!(
+                "`store` index must be int64, got {:?}",
+                self.walk(&ti)
+            ));
+        }
+        if self.unify(&tv, &elem).is_err() {
+            return Err(format!(
+                "`store` value type {:?} does not match element type {:?}",
+                self.walk(&tv),
+                self.walk(&elem)
+            ));
+        }
+        let rt = self.walk(&elem);
+        Ok((Core::ArraySet(Box::new(a), Box::new(i), Box::new(v)), rt))
+    }
+
+    /// `(array-length* a)` : (array α) -> int64.
+    ///
+    /// Issue #476: at a BOXED receiver, dispatches to
+    /// [`Core::BoxedOp`]`(`[`BoxedOp::Len`]`)` — see [`Self::elab_fetch`]'s
+    /// doc comment for why.
+    fn elab_array_len(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`array-length*` expects 1 arg, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        if matches!(self.walk(&ta), Ty::Boxed) {
+            return Ok((Core::BoxedOp(BoxedOp::Len, vec![a]), Ty::Int64));
+        }
+        let elem = self.fresh();
+        if self.unify(&ta, &Ty::Array(Box::new(elem))).is_err() {
+            return Err(format!(
+                "`array-length*` expects an array, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        Ok((Core::ArrayLen(Box::new(a)), Ty::Int64))
+    }
+
+    /// `(equal a b)` at boxed operands (issue #476): `PartialEq for LispVal`
+    /// (`src/lib.rs`) is the exact relation, so dispatches to
+    /// [`Core::BoxedOp`]`(`[`BoxedOp::Equal`]`)`. Any other operand type
+    /// combination is unchanged from before this dispatch existed — falls
+    /// through to the ordinary call path (`EQUAL` has no declared/registered
+    /// scheme, so codegen still rejects it and checking still degrades to
+    /// `Any`, exactly as if this arm were absent).
+    fn elab_equal(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() == 2 {
+            let (a, ta) = self.elab(&args[0], scope, max)?;
+            let (b, tb) = self.elab(&args[1], scope, max)?;
+            if matches!(self.walk(&ta), Ty::Boxed) || matches!(self.walk(&tb), Ty::Boxed) {
+                if self.unify(&ta, &Ty::Boxed).is_err() || self.unify(&tb, &Ty::Boxed).is_err() {
+                    return Err(format!(
+                        "`equal` operands disagree: {:?} vs {:?}",
+                        self.walk(&ta),
+                        self.walk(&tb)
+                    ));
+                }
+                return Ok((Core::BoxedOp(BoxedOp::Equal, vec![a, b]), Ty::Bool));
+            }
+        }
+        self.elab_call("EQUAL", args, scope, max)
+    }
+
+    /// `(hash-code x)` at a boxed operand (issue #476): calls
+    /// `crate::hash_code` (the #474 implementation, extracted so the
+    /// interpreter builtin and every typed tier agree bit-for-bit) via
+    /// [`Core::BoxedOp`]`(`[`BoxedOp::Hash`]`)`. Any other operand type falls
+    /// through to the ordinary call path, unchanged from before this
+    /// dispatch existed.
+    fn elab_hash_code(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() == 1 {
+            let (a, ta) = self.elab(&args[0], scope, max)?;
+            if matches!(self.walk(&ta), Ty::Boxed) {
+                return Ok((Core::BoxedOp(BoxedOp::Hash, vec![a]), Ty::Int64));
+            }
+        }
+        self.elab_call("HASH-CODE", args, scope, max)
+    }
+
+    /// `(array-add!/-sub!/-mul! out a b)` : (array α) (array α) (array α) ->
+    /// (array α), α ∈ {int64, float64}. All three arrays must unify to the
+    /// SAME element type; the op iterates `min(len out, len a, len b)`,
+    /// wrapping (int) or ordinary (float) elementwise arithmetic, mutating
+    /// `out` in place. Codegen-only: `α` must resolve to a concrete
+    /// `int64`/`float64` here (not just unify — [`Self::resolve`] forces it),
+    /// or this returns `Err` and the whole function falls back to
+    /// interpreted, exactly like [`Self::elab_float`]/[`Self::elab_ash`]
+    /// never silently coercing an unresolved/`any` operand.
+    fn elab_array_map2(
+        &self,
+        op: BinOp,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 3 {
+            return Err(format!(
+                "array op expects 3 args (out a b), got {}",
+                args.len()
+            ));
+        }
+        let (out, tout) = self.elab(&args[0], scope, max)?;
+        let (a, ta) = self.elab(&args[1], scope, max)?;
+        let (b, tb) = self.elab(&args[2], scope, max)?;
+        let elem = self.fresh();
+        let arr_ty = Ty::Array(Box::new(elem.clone()));
+        if self.unify(&tout, &arr_ty).is_err() {
+            return Err(format!(
+                "array op `out` must be an array, got {:?}",
+                self.walk(&tout)
+            ));
+        }
+        if self.unify(&ta, &arr_ty).is_err() {
+            return Err(format!(
+                "array op `a` must be an array of the same element type as `out`, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        if self.unify(&tb, &arr_ty).is_err() {
+            return Err(format!(
+                "array op `b` must be an array of the same element type as `out`, got {:?}",
+                self.walk(&tb)
+            ));
+        }
+        let elem_ty = self
+            .resolve(&elem)
+            .map_err(|e| format!("array op: cannot infer element type: {e}"))?;
+        let kind = match elem_ty {
+            Ty::Int64 => NumKind::I,
+            Ty::Float64 => NumKind::F,
+            other => {
+                return Err(format!(
+                    "array op element type must resolve to int64 or float64, got {other:?}"
+                ));
+            }
+        };
+        Ok((
+            Core::ArrayMap2(op, kind, Box::new(out), Box::new(a), Box::new(b)),
+            Ty::Array(Box::new(elem_ty)),
+        ))
+    }
+
+    /// `(array-div!/-scale!/-fma!/-neg! out …)` (#394): every array operand
+    /// unifies with one `(array α)`, the `array-scale!` factor with `α`;
+    /// `α` must RESOLVE to int64/float64 (as for [`Self::elab_array_map2`]),
+    /// and `array-div!` to float64 — int64 division stays interpreted, where
+    /// the tree-walker rejects it.
+    fn elab_array_op(
+        &self,
+        op: ArrOp,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        const NAMES: [&str; 4] = ["out", "a", "b", "c"];
+        if args.len() != op.arity() {
+            return Err(format!(
+                "array op expects {} args, got {}",
+                op.arity(),
+                args.len()
+            ));
+        }
+        let elem = self.fresh();
+        let arr_ty = Ty::Array(Box::new(elem.clone()));
+        let mut cores = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let (c, t) = self.elab(a, scope, max)?;
+            if !op.operand_is_array(i) {
+                if self.unify(&t, &elem).is_err() {
+                    return Err(format!(
+                        "array-scale! factor must have the array element type, got {:?}",
+                        self.walk(&t)
+                    ));
+                }
+            } else if self.unify(&t, &arr_ty).is_err() {
+                return Err(format!(
+                    "array op `{}` must be an array of the same element type as `out`, got {:?}",
+                    NAMES[i],
+                    self.walk(&t)
+                ));
+            }
+            cores.push(c);
+        }
+        let elem_ty = self
+            .resolve(&elem)
+            .map_err(|e| format!("array op: cannot infer element type: {e}"))?;
+        let kind = match elem_ty {
+            Ty::Int64 if op == ArrOp::Div => {
+                return Err("array-div! is float64-only; int64 stays interpreted".to_string());
+            }
+            Ty::Int64 => NumKind::I,
+            Ty::Float64 => NumKind::F,
+            other => {
+                return Err(format!(
+                    "array op element type must resolve to int64 or float64, got {other:?}"
+                ));
+            }
+        };
+        Ok((Core::ArrayOp(op, kind, cores), Ty::Array(Box::new(elem_ty))))
+    }
+
+    /// `(array-add/-sub/-mul a b)` (#394): a fresh array of
+    /// `min(len a, len b)` elements holding `a[i] OP b[i]`, i.e.
+    /// `(array-OP! (make-array (min (array-length* a) (array-length* b))) a b)`
+    /// with `a`/`b` each evaluated once into a temp slot. Same element-type
+    /// rule as [`Self::elab_array_map2`].
+    fn elab_array_alloc(
+        &self,
+        op: BinOp,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!(
+                "allocating array op expects 2 args (a b), got {}",
+                args.len()
+            ));
+        }
+        // Reserve the two temp slots BEFORE elaborating `a`/`b` (#501): `sa`
+        // is live while `b` runs, so a temp user nested in `b` must take
+        // slots above it rather than overwrite it.
+        let base = scope.len();
+        for _ in 0..2 {
+            scope.push((String::new(), self.fresh()));
+        }
+        *max = (*max).max(scope.len());
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        let (b, tb) = self.elab(&args[1], scope, max)?;
+        scope.truncate(base);
+        let elem = self.fresh();
+        let arr_ty = Ty::Array(Box::new(elem.clone()));
+        if self.unify(&ta, &arr_ty).is_err() {
+            return Err(format!(
+                "array op `a` must be an array, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        if self.unify(&tb, &arr_ty).is_err() {
+            return Err(format!(
+                "array op `b` must be an array of the same element type as `a`, got {:?}",
+                self.walk(&tb)
+            ));
+        }
+        let elem_ty = self
+            .resolve(&elem)
+            .map_err(|e| format!("array op: cannot infer element type: {e}"))?;
+        let kind = match elem_ty {
+            Ty::Int64 => NumKind::I,
+            Ty::Float64 => NumKind::F,
+            other => {
+                return Err(format!(
+                    "array op element type must resolve to int64 or float64, got {other:?}"
+                ));
+            }
+        };
+        let rt = Ty::Array(Box::new(elem_ty));
+        let (sa, sb) = (base, base + 1);
+        let len = |s: usize| Box::new(Core::ArrayLen(Box::new(Core::Var(s))));
+        let n = Core::If(
+            Box::new(Core::Cmp(NumKind::I, CmpOp::Lt, len(sa), len(sb))),
+            len(sa),
+            len(sb),
+        );
+        let map = Core::ArrayMap2(
+            op,
+            kind,
+            Box::new(Core::ArrayNew(Box::new(n))),
+            Box::new(Core::Var(sa)),
+            Box::new(Core::Var(sb)),
+        );
+        Ok((
+            Core::Let(
+                sa,
+                Box::new(a),
+                Box::new(Core::Let(sb, Box::new(b), Box::new(map))),
+            ),
+            rt,
+        ))
+    }
+
+    /// Resolve the element type of an array reduction operand to a
+    /// [`NumKind`]. The element type must already be determined by the
+    /// function's other constraints, exactly as for `+` and the elementwise
+    /// array ops: an unconstrained element is an elaboration error (the
+    /// function stays interpreted) rather than a guess, so a reduction never
+    /// commits to int64 for an array that turns out to hold floats.
+    fn reduce_elem_kind(&self, elem: &Ty, what: &str) -> Result<(NumKind, Ty), String> {
+        let elem_ty = self
+            .resolve(elem)
+            .map_err(|e| format!("{what}: cannot infer element type: {e}"))?;
+        match elem_ty {
+            Ty::Int64 => Ok((NumKind::I, Ty::Int64)),
+            Ty::Float64 => Ok((NumKind::F, Ty::Float64)),
+            other => Err(format!(
+                "{what} element type must resolve to int64 or float64, got {other:?}"
+            )),
+        }
+    }
+
+    /// `(array-sum a)` : (array int64) -> int64 | (array float64) -> float64.
+    /// int64 wraps (exact in any order). float64 follows Fortran's `SUM`: the
+    /// result approximates the mathematical sum and the order of additions is
+    /// unspecified (see [`Core::ArraySum`]).
+    fn elab_array_sum(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`array-sum` expects 1 arg, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        let elem = self.fresh();
+        if self.unify(&ta, &Ty::Array(Box::new(elem.clone()))).is_err() {
+            return Err(format!(
+                "`array-sum` expects an (array int64) or (array float64) argument, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        let (kind, ty) = self.reduce_elem_kind(&elem, "`array-sum`")?;
+        Ok((Core::ArraySum(kind, Box::new(a)), ty))
+    }
+
+    /// `(array-dot a b)` : (array T) (array T) -> T for T in {int64, float64}.
+    /// Sum over `i in 0..min(len a, len b)` of `a[i] * b[i]`; same contract as
+    /// [`Self::elab_array_sum`] (float: unspecified addition order, no FMA
+    /// required or forbidden by the language).
+    fn elab_array_dot(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`array-dot` expects 2 args, got {}", args.len()));
+        }
+        let (a, ta) = self.elab(&args[0], scope, max)?;
+        let (b, tb) = self.elab(&args[1], scope, max)?;
+        let elem = self.fresh();
+        let arr = Ty::Array(Box::new(elem.clone()));
+        if self.unify(&ta, &arr).is_err() {
+            return Err(format!(
+                "`array-dot` expects an (array int64) or (array float64) first argument, got {:?}",
+                self.walk(&ta)
+            ));
+        }
+        if self.unify(&tb, &arr).is_err() {
+            return Err(format!(
+                "`array-dot` expects its second argument to have the first's element type, got {:?}",
+                self.walk(&tb)
+            ));
+        }
+        let (kind, ty) = self.reduce_elem_kind(&elem, "`array-dot`")?;
+        Ok((Core::ArrayDot(kind, Box::new(a), Box::new(b)), ty))
+    }
+
+    // --- checker-only list/pair forms (#162) -------------------------------
+    // These run only in `checking` mode; the produced `Core` is a placeholder
+    // (`LitI(0)`) since the checker never compiles — only the *types* matter.
+
+    /// `(cons x xs)` : α (list α) -> (list α). The list-cons view (lamedh lists
+    /// are nested conses); proper homogeneous lists are the useful case to check.
+    fn elab_cons(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`cons` expects 2 args, got {}", args.len()));
+        }
+        let (_, tx) = self.elab(&args[0], scope, max)?;
+        let (_, txs) = self.elab(&args[1], scope, max)?;
+        // Dotted-pair view: a tail already known to be a non-list ground
+        // type makes an improper pair, `(cons 'k 2)` : (pair symbol int64)
+        // — the alist-cell case. An unknown tail keeps the list-cons view
+        // (the useful default for inference through recursion).
+        if Self::known_non_list(&self.walk(&txs)) {
+            return Ok((Core::LitI(0), Ty::Pair(Box::new(tx), Box::new(txs))));
+        }
+        let lst = Ty::List(Box::new(tx));
+        if self.unify(&txs, &lst).is_err() {
+            return Err(format!(
+                "`cons`: tail {:?} is not a list of the head's type",
+                self.walk(&txs)
+            ));
+        }
+        Ok((Core::LitI(0), self.walk(&lst)))
+    }
+
+    /// `(car xs)` : (list α) -> α.
+    fn elab_car(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`car` expects 1 arg, got {}", args.len()));
+        }
+        let (_, txs) = self.elab(&args[0], scope, max)?;
+        // Pair view: `(car cell)` on a known (pair a b) is a.
+        if let Ty::Pair(a, _) = self.walk(&txs) {
+            return Ok((Core::LitI(0), *a));
+        }
+        let elem = self.fresh();
+        if self.unify(&txs, &Ty::List(Box::new(elem.clone()))).is_err() {
+            return Err(format!("`car` expects a list, got {:?}", self.walk(&txs)));
+        }
+        Ok((Core::LitI(0), self.walk(&elem)))
+    }
+
+    /// `(cdr xs)` : (list α) -> (list α).
+    fn elab_cdr(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`cdr` expects 1 arg, got {}", args.len()));
+        }
+        let (_, txs) = self.elab(&args[0], scope, max)?;
+        // Pair view: `(cdr cell)` on a known (pair a b) is b.
+        if let Ty::Pair(_, b) = self.walk(&txs) {
+            return Ok((Core::LitI(0), *b));
+        }
+        let lst = Ty::List(Box::new(self.fresh()));
+        if self.unify(&txs, &lst).is_err() {
+            return Err(format!("`cdr` expects a list, got {:?}", self.walk(&txs)));
+        }
+        Ok((Core::LitI(0), self.walk(&lst)))
+    }
+
+    /// `(list e0 e1 …)` : all elements unified to α -> (list α). Empty → (list α).
+    fn elab_list(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let elem = self.fresh();
+        for (i, a) in args.iter().enumerate() {
+            let (_, ta) = self.elab(a, scope, max)?;
+            if self.unify(&ta, &elem).is_err() {
+                return Err(format!(
+                    "`list` element {i} has type {:?}, expected {:?}",
+                    self.walk(&ta),
+                    self.walk(&elem)
+                ));
+            }
+        }
+        Ok((Core::LitI(0), Ty::List(Box::new(self.walk(&elem)))))
+    }
+
+    /// `(null xs)` : (list α) -> bool.
+    fn elab_null(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`null` expects 1 arg, got {}", args.len()));
+        }
+        let (_, txs) = self.elab(&args[0], scope, max)?;
+        if self.unify(&txs, &Ty::List(Box::new(self.fresh()))).is_err() {
+            return Err(format!("`null` expects a list, got {:?}", self.walk(&txs)));
+        }
+        Ok((Core::LitI(0), Ty::Bool))
+    }
+
+    /// Extract the quoted field symbol from a `record-ref`/`record-with`
+    /// field position: `(quote f)`. A computed field expression falls back
+    /// to the dynamic path (return None -> caller degrades to `Any`).
+    fn quoted_field(arg: &LispVal) -> Option<String> {
+        let items = list_to_vec(arg);
+        match items.as_slice() {
+            [LispVal::Symbol(q), LispVal::Symbol(f)] if q.borrow().name == "QUOTE" => {
+                Some(f.borrow().name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `(record-new 'brand v1 … vn)` : the branded constructor rule (issue
+    /// #308) — looks the brand up in the registry, unifies each argument
+    /// with its field type, and returns the NOMINAL Ty::Struct. This is
+    /// what makes `record-new` values carry their brand in checked code:
+    /// passing a same-shaped-but-differently-branded record where a
+    /// specific brand is demanded is a static error. An unquoted/unknown
+    /// brand degrades to `Any` (the dynamic frontier).
+    fn elab_record_new(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.is_empty() {
+            return Err("`record-new` expects a brand and field values".to_string());
+        }
+        let Some(brand) = Self::quoted_field(&args[0]) else {
+            for a in &args[1..] {
+                self.elab(a, scope, max)?;
+            }
+            return Ok((Core::LitI(0), Ty::Any));
+        };
+        let Some(def) = self.structs.get(&brand).cloned() else {
+            // Parametric brand (0.3 HM generics): instantiate fresh type
+            // arguments, demand the substituted field types, return the
+            // application — `(record-new 'some v)` : (some α) with α = v's
+            // type, absorbing into (option α) where demanded.
+            if let Some(gdef) = self.generics.get(&brand).cloned() {
+                if args.len() - 1 != gdef.fields.len() {
+                    return Err(format!(
+                        "`record-new`: {} has {} field(s), got {} value(s)",
+                        brand,
+                        gdef.fields.len(),
+                        args.len() - 1
+                    ));
+                }
+                let fresh: Vec<Ty> = (0..gdef.arity).map(|_| self.fresh()).collect();
+                let m: HashMap<u32, Ty> =
+                    (0..gdef.arity as u32).zip(fresh.iter().cloned()).collect();
+                for (arg, (fname, fty)) in args[1..].iter().zip(gdef.fields.iter()) {
+                    let (_, ta) = self.elab(arg, scope, max)?;
+                    let want = Infer::subst_vars(fty, &m);
+                    self.unify(&ta, &want).map_err(|e| {
+                        format!("`record-new`: field {}: {e}", fname.to_lowercase())
+                    })?;
+                }
+                return Ok((Core::LitI(0), Ty::App(gdef, fresh)));
+            }
+            // Unregistered at check time (e.g. forward use): dynamic frontier.
+            for a in &args[1..] {
+                self.elab(a, scope, max)?;
+            }
+            return Ok((Core::LitI(0), Ty::Any));
+        };
+        if args.len() - 1 != def.fields.len() {
+            return Err(format!(
+                "`record-new`: {} has {} field(s), got {} value(s)",
+                brand,
+                def.fields.len(),
+                args.len() - 1
+            ));
+        }
+        for (arg, (fname, fty)) in args[1..].iter().zip(def.fields.iter()) {
+            let (_, ta) = self.elab(arg, scope, max)?;
+            self.unify(&ta, fty)
+                .map_err(|e| format!("`record-new`: field {}: {e}", fname.to_lowercase()))?;
+        }
+        Ok((Core::LitI(0), Ty::Struct(def)))
+    }
+
+    /// `(record-ref x 'f)` : (record ((f α)) ρ) → α — the checker-native row
+    /// rule (issue #308). This is what makes row types DERIVED end-to-end:
+    /// any function reading a field through the primitive infers an open
+    /// record requirement with no declare-type! axioms. A struct argument
+    /// satisfies it via subsumption (#299); a computed (non-quoted) field
+    /// name degrades to `Any` like other dynamic frontiers.
+    fn elab_record_ref(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`record-ref` expects 2 args, got {}", args.len()));
+        }
+        let (_, tx) = self.elab(&args[0], scope, max)?;
+        let Some(field) = Self::quoted_field(&args[1]) else {
+            return Ok((Core::LitI(0), Ty::Any));
+        };
+        let alpha = self.fresh();
+        let rho = self.fresh();
+        self.unify(
+            &tx,
+            &Ty::Record(vec![(field, alpha.clone())], Some(Box::new(rho))),
+        )
+        .map_err(|e| format!("`record-ref`: {e}"))?;
+        Ok((Core::LitI(0), self.walk(&alpha)))
+    }
+
+    /// `(record-with x 'f v)` : (record ((f α)) ρ) α → same record type —
+    /// typed functional update (issue #308).
+    fn elab_record_with(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 3 {
+            return Err(format!("`record-with` expects 3 args, got {}", args.len()));
+        }
+        let (_, tx) = self.elab(&args[0], scope, max)?;
+        let (_, tv) = self.elab(&args[2], scope, max)?;
+        let Some(field) = Self::quoted_field(&args[1]) else {
+            return Ok((Core::LitI(0), Ty::Any));
+        };
+        let alpha = self.fresh();
+        let rho = self.fresh();
+        self.unify(
+            &tx,
+            &Ty::Record(vec![(field, alpha.clone())], Some(Box::new(rho))),
+        )
+        .map_err(|e| format!("`record-with`: {e}"))?;
+        self.unify(&tv, &alpha)
+            .map_err(|e| format!("`record-with`: replacement value: {e}"))?;
+        Ok((Core::LitI(0), self.walk(&tx)))
+    }
+
+    /// `(cond (test body…) …)` : every clause body unifies to one result type;
+    /// tests follow Lisp truthiness (any type). With no clause, `any`.
+    ///
+    /// #336 investigated extending the `if`-branch honesty-rule degrade
+    /// (see `join_branch_types`) to `cond` too, but a self-recursive
+    /// nil-on-miss helper's OWN clause join happens *before* `cond`'s
+    /// result type is even computed: `check_callee`'s pre-allocated
+    /// recursion-assumption return variable gets bound the moment a
+    /// concrete sibling clause (e.g. `(equal … ) i)`) unifies with the
+    /// recursive call's placeholder, which is exactly the ordinary,
+    /// desired behavior for recursion — but it means the honesty-rule
+    /// degrade (applied only to `cond`'s own *result*) arrives too late to
+    /// keep that variable free, and downstream callers that legitimately
+    /// relied on the pre-#336 all-gradual fallback (a failed derivation
+    /// degrading the *caller's* call site to a free var) regress from
+    /// CHECKED to a hard TYPE-ERROR (`string-index-of-aux` chains into
+    /// `contains-p`, `$require-load`, `$module-qualified-p`). `if` has no
+    /// such accumulator to corrupt (each `if` is a single two-way join), so
+    /// it stays fixed; `cond` is deliberately left untouched here — a
+    /// correct `cond` fix needs the self-recursion assumption itself to
+    /// stay honest about nil-on-miss bodies (the ticket's own 0.4 direction
+    /// "derive nil-on-miss bodies as no-result"), not a change local to the
+    /// join. See the PR body for the full trace.
+    fn elab_cond(
+        &self,
+        clauses: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let result = self.fresh();
+        let mut had_clause = false;
+        let mut nil_bodies = Vec::new();
+        for clause in clauses {
+            let parts = list_to_vec(clause);
+            if parts.is_empty() {
+                continue;
+            }
+            let saved = scope.len();
+            let (_, test_ty) = self.elab(&parts[0], scope, max)?;
+            // A clause with no body yields the test value; otherwise the body.
+            let bt = if parts.len() == 1 {
+                test_ty
+            } else {
+                self.elab_body(&parts[1..], scope, max)?.1
+            };
+            scope.truncate(saved);
+            had_clause = true;
+            if parts.len() > 1 && self.ends_in_bare_nil(&parts[parts.len() - 1]) {
+                nil_bodies.push(bt);
+                continue;
+            }
+            if self.unify(&bt, &result).is_err() {
+                return Err(format!(
+                    "`cond` clauses disagree: {:?} vs {:?}",
+                    self.walk(&bt),
+                    self.walk(&result)
+                ));
+            }
+        }
+        self.join_nil_clauses("cond", &result, nil_bodies)?;
+        if had_clause {
+            Ok((Core::LitI(0), self.walk(&result)))
+        } else {
+            Ok((Core::LitI(0), Ty::Any))
+        }
+    }
+
+    /// Checker-mode `(case key (data body…) …)` (#404): the key is
+    /// elaborated, the clause selectors are quoted data (never evaluated),
+    /// and every clause body joins to one result type — as `cond` does. An
+    /// empty clause body yields nil at runtime and is `Any`. Previously the
+    /// selectors were elaborated as calls, a false TYPE-ERROR.
+    fn elab_case_check(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        let Some(key) = args.first() else {
+            return Err("`case` needs a key".to_string());
+        };
+        self.elab(key, scope, max)?;
+        let result = self.fresh();
+        let mut had_clause = false;
+        let mut nil_bodies = Vec::new();
+        for clause in &args[1..] {
+            let parts = list_to_vec(clause);
+            if parts.is_empty() {
+                continue;
+            }
+            let saved = scope.len();
+            let bt = if parts.len() == 1 {
+                Ty::Any
+            } else {
+                self.elab_body(&parts[1..], scope, max)?.1
+            };
+            scope.truncate(saved);
+            had_clause = true;
+            if parts.len() > 1 && self.ends_in_bare_nil(&parts[parts.len() - 1]) {
+                nil_bodies.push(bt);
+                continue;
+            }
+            if self.unify(&bt, &result).is_err() {
+                return Err(format!(
+                    "`case` clauses disagree: {:?} vs {:?}",
+                    self.walk(&bt),
+                    self.walk(&result)
+                ));
+            }
+        }
+        self.join_nil_clauses("case", &result, nil_bodies)?;
+        if had_clause {
+            Ok((Core::LitI(0), self.walk(&result)))
+        } else {
+            Ok((Core::LitI(0), Ty::Any))
+        }
+    }
+
+    /// Join the bare-`nil` clause bodies of a `cond`/`case` (#505), deferred
+    /// until every other clause has joined: `nil` is also false, so once the
+    /// other clauses settled on `bool` a nil clause is that boolean's false.
+    /// Otherwise each unifies as an empty list exactly as an in-order clause
+    /// would (unification order does not change the outcome).
+    fn join_nil_clauses(&self, form: &str, result: &Ty, nil_bodies: Vec<Ty>) -> Result<(), String> {
+        for bt in nil_bodies {
+            if matches!(self.walk(result), Ty::Bool) {
+                continue;
+            }
+            if self.unify(&bt, result).is_err() {
+                return Err(format!(
+                    "`{form}` clauses disagree: {:?} vs {:?}",
+                    self.walk(&bt),
+                    self.walk(result)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `(variant-case x (ctor (vars…) body…) … [(else body…)])` — the sum
+    /// eliminator (#350). The scrutinee unifies with each clause ctor's
+    /// OWNING variant (so mixed-variant clauses clash and constructing a
+    /// wrong-variant scrutinee is caught); clause vars bind positionally to
+    /// the ctor's field types; every clause body joins to one result type.
+    /// Exhaustiveness stays a runtime concern — the vau errors, naming the
+    /// missing brands. A ctor unknown at check time binds its vars `Any`
+    /// (the gradual frontier) but its body is still checked and joined.
+    fn elab_variant_case(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.is_empty() {
+            return Err("`variant-case` expects a scrutinee and clauses".to_string());
+        }
+        let (_, tx) = self.elab(&args[0], scope, max)?;
+        let result = self.fresh();
+        let mut had_clause = false;
+        for clause in &args[1..] {
+            let parts = list_to_vec(clause);
+            let Some(LispVal::Symbol(s)) = parts.first() else {
+                return Err(
+                    "`variant-case`: clause must start with a constructor or `else`".to_string(),
+                );
+            };
+            let ctor = s.borrow().name.clone();
+            let saved = scope.len();
+            let body = if ctor == "ELSE" {
+                &parts[1..]
+            } else {
+                if parts.len() < 2 {
+                    return Err(format!(
+                        "`variant-case`: clause for {ctor} needs a binding list"
+                    ));
+                }
+                let mut vars = Vec::new();
+                for v in list_to_vec(&parts[1]) {
+                    match v {
+                        LispVal::Symbol(n) => vars.push(n.borrow().name.clone()),
+                        other => {
+                            return Err(format!(
+                                "`variant-case`: clause for {ctor} binds a non-symbol {other:?}"
+                            ));
+                        }
+                    }
+                }
+                let field_tys: Vec<Ty> = if let Some(def) = self.structs.get(&ctor) {
+                    let owner = self.variants.values().find(|v| v.ctors.contains(&ctor));
+                    let want = match owner {
+                        Some(vd) => Ty::Variant(vd.clone()),
+                        // A brand outside any variant (a plain record case
+                        // via the same eliminator): demand the record itself.
+                        None => Ty::Struct(def.clone()),
+                    };
+                    self.unify(&tx, &want)
+                        .map_err(|e| format!("`variant-case`: scrutinee: {e}"))?;
+                    def.fields.iter().map(|(_, t)| t.clone()).collect()
+                } else if let Some(gdef) = self.generics.get(&ctor).cloned() {
+                    // Parametric ctor (0.3 HM generics): instantiate the
+                    // variant's parameters fresh; the scrutinee is the owning
+                    // variant's application over them, and the clause's field
+                    // types are the ctor's fields under the same instantiation.
+                    let fresh: Vec<Ty> = (0..gdef.arity).map(|_| self.fresh()).collect();
+                    let m: HashMap<u32, Ty> =
+                        (0..gdef.arity as u32).zip(fresh.iter().cloned()).collect();
+                    let want = match gdef.variant.as_deref().and_then(|v| self.generics.get(v)) {
+                        Some(vg) => Ty::App(vg.clone(), fresh),
+                        None => Ty::App(gdef.clone(), fresh),
+                    };
+                    self.unify(&tx, &want)
+                        .map_err(|e| format!("`variant-case`: scrutinee: {e}"))?;
+                    gdef.fields
+                        .iter()
+                        .map(|(_, t)| Infer::subst_vars(t, &m))
+                        .collect()
+                } else {
+                    // Unregistered at check time: the gradual frontier.
+                    vars.iter().map(|_| Ty::Any).collect()
+                };
+                if vars.len() != field_tys.len() {
+                    return Err(format!(
+                        "`variant-case`: clause for {ctor} binds {} var(s) but {ctor} has {} field(s)",
+                        vars.len(),
+                        field_tys.len()
+                    ));
+                }
+                for (v, t) in vars.into_iter().zip(field_tys) {
+                    scope.push((v, t));
+                    *max = (*max).max(scope.len());
+                }
+                &parts[2..]
+            };
+            // An empty clause body yields nil at runtime; its type is `Any`.
+            let bt = if body.is_empty() {
+                Ty::Any
+            } else {
+                self.elab_body(body, scope, max)?.1
+            };
+            scope.truncate(saved);
+            self.unify(&bt, &result)
+                .map_err(|e| format!("`variant-case` clauses disagree: {e}"))?;
+            had_clause = true;
+        }
+        if had_clause {
+            Ok((Core::LitI(0), self.walk(&result)))
+        } else {
+            Ok((Core::LitI(0), Ty::Any))
+        }
+    }
+
+    /// `(when test body…)` / `(unless test body…)`: the test follows truthiness
+    /// and the body is checked, but the value is the body *or* `nil`
+    /// (heterogeneous), so the result is `any`.
+    fn elab_when(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.is_empty() {
+            return Err("`when`/`unless` need a condition".to_string());
+        }
+        self.elab(&args[0], scope, max)?;
+        if args.len() > 1 {
+            self.elab_body(&args[1..], scope, max)?;
+        }
+        Ok((Core::LitI(0), Ty::Any))
+    }
+
+    /// `(quote x)`: a quoted symbol is `symbol`, quoted `()` is a list, any other
+    /// quoted datum is `any` (the checker does not model quoted structure).
+    fn elab_quote(&self, args: &[LispVal]) -> Result<(Core, Ty), String> {
+        let ty = match args.first() {
+            Some(LispVal::Symbol(_)) => Ty::Symbol,
+            Some(LispVal::Nil) => Ty::List(Box::new(self.fresh())),
+            _ => Ty::Any,
+        };
+        Ok((Core::LitI(0), ty))
+    }
+
+    /// A unary float intrinsic `(op x)`: the argument must unify with
+    /// `float64`, the result type is `result` (float64 or int64 per op). If the
+    /// argument is not concretely float (e.g. an int-typed expression), the
+    /// unify fails and the whole function falls back to interpreted — the
+    /// argument is never silently coerced.
+    fn elab_funary(
+        &self,
+        op: FUnOp,
+        result: Ty,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`{op:?}` expects 1 argument, got {}", args.len()));
+        }
+        let (arg_core, arg_ty) = self.elab(&args[0], scope, max)?;
+        self.unify(&arg_ty, &Ty::Float64)
+            .map_err(|e| format!("float intrinsic argument must be float64: {e}"))?;
+        Ok((Core::FUnary(op, Box::new(arg_core)), result))
+    }
+
+    /// `(expt b e)` (#398) over concrete operand kinds, each combination
+    /// mirroring one arm of the evaluator's `BuiltinFunc::Expt`:
+    /// float^float = `powf`, float^int = `float_powi(b, e)` (#507), int^float =
+    /// `(b as f64).powf(e)` — all `float64`, via the `jit_ftrans2` libm
+    /// trampoline. int^int is not compiled: the evaluator returns an integer
+    /// (or a float for a negative exponent) and raises on overflow.
+    fn elab_expt(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`expt` expects 2 arguments, got {}", args.len()));
+        }
+        let (bc, tb) = self.elab(&args[0], scope, max)?;
+        let (ec, te) = self.elab(&args[1], scope, max)?;
+        let (bc, ec) = (Box::new(bc), Box::new(ec));
+        let core = match (self.walk(&tb), self.walk(&te)) {
+            (Ty::Float64, Ty::Float64) => Core::FBinary(FBinOp::Pow, bc, ec),
+            (Ty::Float64, Ty::Int64) => Core::FBinary(FBinOp::PowI, bc, ec),
+            (Ty::Int64, Ty::Float64) => {
+                Core::FBinary(FBinOp::Pow, Box::new(Core::IntToFloat(bc)), ec)
+            }
+            (Ty::Int64, Ty::Int64) => {
+                return Err("`expt` of int64 by int64 stays interpreted".to_string());
+            }
+            (b, e) => {
+                return Err(format!(
+                    "`expt` needs concrete int64 or float64 operands, got {b:?} and {e:?}"
+                ));
+            }
+        };
+        Ok((core, Ty::Float64))
+    }
+
+    /// `(float x)`: int→float conversion, identity on a float. The argument's
+    /// resolved kind decides: a `float64` argument elaborates to itself (no
+    /// node); an `int64` argument gets an `IntToFloat` widening; anything else
+    /// (unresolved/`any`) cannot be compiled, so the function stays interpreted.
+    fn elab_float(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`float` expects 1 argument, got {}", args.len()));
+        }
+        let (arg_core, arg_ty) = self.elab(&args[0], scope, max)?;
+        match self.walk(&arg_ty) {
+            Ty::Float64 => Ok((arg_core, Ty::Float64)),
+            Ty::Int64 => Ok((Core::IntToFloat(Box::new(arg_core)), Ty::Float64)),
+            other => Err(format!(
+                "`float` needs a concrete int64 or float64 argument, got {other:?}"
+            )),
+        }
+    }
+
+    /// Variadic bitwise fold (`logand`/`logior`/`logxor`): every argument must
+    /// be `int64`; fold left into nested `Bin`s. Zero args yields the op's
+    /// identity element (`-1` for AND, `0` for OR/XOR), matching the evaluator.
+    fn elab_bitwise(
+        &self,
+        op: BinOp,
+        identity: i64,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.is_empty() {
+            return Ok((Core::LitI(identity), Ty::Int64));
+        }
+        let (mut acc, t0) = self.elab(&args[0], scope, max)?;
+        self.unify(&t0, &Ty::Int64)
+            .map_err(|e| format!("bitwise op argument must be int64: {e}"))?;
+        for a in &args[1..] {
+            let (c, t) = self.elab(a, scope, max)?;
+            self.unify(&t, &Ty::Int64)
+                .map_err(|e| format!("bitwise op argument must be int64: {e}"))?;
+            acc = Core::Bin(NumKind::I, op, Box::new(acc), Box::new(c));
+        }
+        Ok((acc, Ty::Int64))
+    }
+
+    /// `(ash n k)` — arithmetic shift. Compiles only when `k` is a compile-time
+    /// integer constant in `-63..=63`: a positive `k` folds to a left shift, a
+    /// negative to an arithmetic right shift by `-k`, `0` is the identity. A
+    /// runtime or out-of-range shift is not compiled (the evaluator's `ash`
+    /// masks/overflows/sign-fills past 63 — semantics the constant path sidesteps
+    /// entirely), so the function stays interpreted.
+    fn elab_ash(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 2 {
+            return Err(format!("`ash` expects 2 arguments, got {}", args.len()));
+        }
+        let (n_core, n_ty) = self.elab(&args[0], scope, max)?;
+        self.unify(&n_ty, &Ty::Int64)
+            .map_err(|e| format!("`ash` value must be int64: {e}"))?;
+        let k = match &args[1] {
+            LispVal::Number(k) => *k,
+            _ => {
+                return Err(
+                    "`ash` shift must be a compile-time integer constant to compile".to_string(),
+                );
+            }
+        };
+        if k == 0 {
+            Ok((n_core, Ty::Int64))
+        } else if (1..=63).contains(&k) {
+            Ok((
+                Core::Bin(
+                    NumKind::I,
+                    BinOp::Shl,
+                    Box::new(n_core),
+                    Box::new(Core::LitI(k)),
+                ),
+                Ty::Int64,
+            ))
+        } else if (-63..=-1).contains(&k) {
+            Ok((
+                Core::Bin(
+                    NumKind::I,
+                    BinOp::AShr,
+                    Box::new(n_core),
+                    Box::new(Core::LitI(-k)),
+                ),
+                Ty::Int64,
+            ))
+        } else {
+            Err(format!(
+                "`ash` shift {k} outside the compilable range -63..=63"
+            ))
+        }
+    }
+
+    /// `(abs x)` → `(if (< x 0) (- x) x)` over `int64`/`float64`, as compilable
+    /// Core. `Core::LitI(0)` is the zero for both kinds (all-zero bits bitcast
+    /// to `+0.0`). Comparison-select, so `(abs NaN)` = `NaN` unchanged,
+    /// matching the evaluator. The float else-branch is `x + 0`, as in
+    /// lib/05-math.lisp, so `(abs -0.0)` = `+0.0` (#518).
+    /// `x` is evaluated once into a temp slot (#397), so a compound argument
+    /// (or one with a side effect, e.g. a `setq`) runs exactly once.
+    fn elab_abs(
+        &self,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.len() != 1 {
+            return Err(format!("`abs` expects 1 argument, got {}", args.len()));
+        }
+        let (xc, tx) = self.elab(&args[0], scope, max)?;
+        self.reject_boxed_arith_cmp(&tx)?;
+        let rt = self
+            .resolve(&tx)
+            .map_err(|_| "`abs`: cannot infer operand type".to_string())?;
+        let num = rt
+            .as_num()
+            .ok_or_else(|| format!("`abs` expects a numeric operand, got {rt:?}"))?;
+        let k: NumKind = num.into();
+        // Evaluate the argument once into a fresh slot (#397): a compound
+        // argument is not recomputed in the test and both branches.
+        let slot = self.temp_slot(scope, max, &rt);
+        let x = || Box::new(Core::Var(slot));
+        let cond = Core::Cmp(k, CmpOp::Lt, x(), Box::new(Core::LitI(0)));
+        let neg = Core::Bin(k, BinOp::Sub, Box::new(Core::LitI(0)), x());
+        let pos = match k {
+            NumKind::I => x(),
+            NumKind::F => Box::new(Core::Bin(k, BinOp::Add, x(), Box::new(Core::LitI(0)))),
+        };
+        let sel = Core::If(Box::new(cond), Box::new(neg), pos);
+        Ok((Core::Let(slot, Box::new(xc), Box::new(sel)), rt))
+    }
+
+    /// A fresh, never-named slot for a desugaring temp (#397). It is not left
+    /// in `scope` (no source name can reach it); `max` grows so the frame
+    /// reserves it.
+    fn temp_slot(&self, scope: &mut Scope, max: &mut usize, ty: &Ty) -> usize {
+        let slot = scope.len();
+        scope.push((String::new(), ty.clone()));
+        *max = (*max).max(scope.len());
+        scope.pop();
+        slot
+    }
+
+    /// One fold step of compiled float64 `max`/`min` (#530): IEEE 754-2019
+    /// `maximum`/`minimum` on `a` (the argument) and `m` (the fold of the
+    /// rest), both already in slots. A NaN on either side propagates; otherwise
+    /// the larger (`max`) or smaller (`min`) value wins, and between `-0.0`
+    /// and `+0.0` the sign decides (`-0.0 < +0.0`). The sign test is
+    /// `(1.0 / a) < 0.0`, which is `-inf` exactly for `a = -0.0`; float
+    /// division by zero is IEEE in every edition, so no branch is needed.
+    ///
+    /// ```text
+    /// max: if a != a then a  elif m != m then m  elif a > m then a
+    ///      elif m > a then m  elif 1/a < 0 then m  else a
+    /// min: if a != a then a  elif m != m then m  elif a < m then a
+    ///      elif m < a then m  elif 1/a < 0 then a  else m
+    /// ```
+    fn float_min_max_step(is_max: bool, a: usize, m: usize) -> Core {
+        let var = |s: usize| Box::new(Core::Var(s));
+        let cmp =
+            |op: CmpOp, x: usize, y: usize| Box::new(Core::Cmp(NumKind::F, op, var(x), var(y)));
+        let (strict, neg_zero_pick, other) = if is_max {
+            (CmpOp::Gt, m, a)
+        } else {
+            (CmpOp::Lt, a, m)
+        };
+        let recip = Box::new(Core::Bin(
+            NumKind::F,
+            BinOp::Div,
+            Box::new(Core::LitF(1.0)),
+            var(a),
+        ));
+        let a_is_neg_zero = Box::new(Core::Cmp(
+            NumKind::F,
+            CmpOp::Lt,
+            recip,
+            Box::new(Core::LitF(0.0)),
+        ));
+        Core::If(
+            cmp(CmpOp::Ne, a, a),
+            var(a),
+            Box::new(Core::If(
+                cmp(CmpOp::Ne, m, m),
+                var(m),
+                Box::new(Core::If(
+                    cmp(strict, a, m),
+                    var(a),
+                    Box::new(Core::If(
+                        cmp(strict, m, a),
+                        var(m),
+                        Box::new(Core::If(a_is_neg_zero, var(neg_zero_pick), var(other))),
+                    )),
+                )),
+            )),
+        )
+    }
+
+    /// Variadic `(max a b …)` / `(min a b …)` over a shared `int64`/`float64`
+    /// type, as compilable Core (`cmp` = `Gt` for max, `Lt` for min). Mirrors
+    /// the evaluator's `max`/`min` in lib/05-math.lisp: arguments are evaluated
+    /// once, left to right, then folded from the RIGHT, `acc[i] = step(arg[i],
+    /// acc[i+1])`; one argument is itself. On `int64` each step is the plain
+    /// comparison select `(if (cmp a m) a m)`. On `float64` each step is the
+    /// IEEE 754-2019 `maximum`/`minimum` rule of `float_min_max_step`, which
+    /// the evaluator also implements, so NaN and `-0.0`/`+0.0` agree. Every
+    /// argument and every partial result lives in its own slot (#397), so
+    /// nothing is recomputed. The arguments must share one type: an int
+    /// literal beside a float64 operand is a type error, not a coercion (#530).
+    fn elab_min_max_compiled(
+        &self,
+        cmp: CmpOp,
+        args: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if args.is_empty() {
+            return Err("compiled min/max needs at least 1 argument".to_string());
+        }
+        // Reserve one slot per argument, then one per fold step, BEFORE
+        // elaborating the arguments (#501): a nested min/max/abs (or any
+        // other temp user) then takes slots above these, so its lets cannot
+        // overwrite an argument slot that is still live. The slots stay
+        // reserved together while the nested lets are built.
+        let base = scope.len();
+        let n = args.len();
+        for _ in 0..(2 * n) {
+            scope.push((String::new(), self.fresh()));
+        }
+        *max = (*max).max(scope.len());
+        let mut elabs = Vec::with_capacity(n);
+        for a in args {
+            elabs.push(self.elab(a, scope, max)?);
+        }
+        scope.truncate(base);
+        for (_, t) in &elabs {
+            self.reject_boxed_arith_cmp(t)?;
+        }
+        // Issue #530: an integer literal is NOT coerced beside a float64
+        // operand. The operands must share one type, so `(max x 1)` with
+        // `x: float64` is a type error in typed code (the untyped evaluator's
+        // float contagion, `(max 0.5 1)` = `1.0`, is a separate path).
+        let ta = elabs[0].1.clone();
+        for (_, t) in &elabs[1..] {
+            self.unify(&ta, t)
+                .map_err(|e| format!("min/max operands disagree: {e}"))?;
+        }
+        let rt = self
+            .resolve(&ta)
+            .map_err(|_| "min/max: cannot infer operand type".to_string())?;
+        let num = rt
+            .as_num()
+            .ok_or_else(|| format!("min/max expects numeric operands, got {rt:?}"))?;
+        let k: NumKind = num.into();
+        let arg_slot = |i: usize| base + i;
+        let acc_slot = |i: usize| base + n + i;
+        // Innermost: fold from the right. acc[n-1] = arg[n-1];
+        // acc[i] = step(arg[i], acc[i+1]). Int64: the comparison select
+        // `if arg[i] cmp acc[i+1] then arg[i] else acc[i+1]`. Float64: the
+        // IEEE maximum/minimum step (`float_min_max_step`).
+        let is_max = matches!(cmp, CmpOp::Gt);
+        let mut body = Core::Var(acc_slot(0));
+        for i in 0..n - 1 {
+            let sel = match k {
+                NumKind::I => {
+                    let a = || Box::new(Core::Var(arg_slot(i)));
+                    let m = || Box::new(Core::Var(acc_slot(i + 1)));
+                    Core::If(Box::new(Core::Cmp(k, cmp, a(), m())), a(), m())
+                }
+                NumKind::F => Self::float_min_max_step(is_max, arg_slot(i), acc_slot(i + 1)),
+            };
+            body = Core::Let(acc_slot(i), Box::new(sel), Box::new(body));
+        }
+        body = Core::Let(
+            acc_slot(n - 1),
+            Box::new(Core::Var(arg_slot(n - 1))),
+            Box::new(body),
+        );
+        for (i, (c, _)) in elabs.into_iter().enumerate().rev() {
+            body = Core::Let(arg_slot(i), Box::new(c), Box::new(body));
+        }
+        Ok((body, rt))
+    }
+
+    /// Elaborate a form whose value is discarded (a non-final body form, or
+    /// any form of a `while`/`for` body). A `cond`/`when`/`unless`/`case`
+    /// there desugars in statement mode (#404): every branch yields `false`,
+    /// so branches of any type join and the nil-on-miss is representable.
+    /// A `let`/`let*`/`let-typed`/`progn` there discards its last form's
+    /// value too, so statement mode reaches through it (#513).
+    fn elab_stmt(
+        &self,
+        form: &LispVal,
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if !self.checking
+            && let LispVal::Cons { .. } = form
+        {
+            let items = list_to_vec(form);
+            if let Some(LispVal::Symbol(s)) = items.first() {
+                let head = s.borrow().name.clone();
+                match head.as_str() {
+                    "COND" | "WHEN" | "UNLESS" | "CASE" => {
+                        let d = desugar_branch(&head, &items[1..], true)?;
+                        return self.elab(&d, scope, max);
+                    }
+                    "LET" | "LET-TYPED" | "LET*" => {
+                        if head == "LET*" {
+                            check_let_star(&items[1..])?;
+                        }
+                        return self.elab_let(&items[1..], true, scope, max);
+                    }
+                    "PROGN" => return self.elab_body_mode(&items[1..], true, scope, max),
+                    _ => {}
+                }
+            }
+        }
+        self.elab(form, scope, max)
+    }
+
+    /// A loop body: every form's value is discarded.
+    fn elab_loop_body(
+        &self,
+        forms: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<Core, String> {
+        if forms.is_empty() {
+            return Err("empty body".to_string());
+        }
+        let mut cores = Vec::with_capacity(forms.len());
+        for f in forms {
+            cores.push(self.elab_stmt(f, scope, max)?.0);
+        }
+        Ok(if cores.len() == 1 {
+            cores.pop().unwrap()
+        } else {
+            Core::Seq(cores)
+        })
+    }
+
+    pub(super) fn elab_body(
+        &self,
+        forms: &[LispVal],
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        self.elab_body_mode(forms, false, scope, max)
+    }
+
+    /// A body whose last form is in statement mode when `stmt` (the body's
+    /// own value is discarded, #513), else in value position.
+    fn elab_body_mode(
+        &self,
+        forms: &[LispVal],
+        stmt: bool,
+        scope: &mut Scope,
+        max: &mut usize,
+    ) -> Result<(Core, Ty), String> {
+        if forms.is_empty() {
+            return Err("empty body".to_string());
+        }
+        let mut cores = Vec::with_capacity(forms.len());
+        let mut last_ty = Ty::Int64;
+        for (i, f) in forms.iter().enumerate() {
+            let (c, t) = if stmt || i + 1 < forms.len() {
+                self.elab_stmt(f, scope, max)?
+            } else {
+                self.elab(f, scope, max)?
+            };
+            cores.push(c);
+            last_ty = t;
+        }
+        // A single form needs no wrapper; multiple forms sequence (earlier ones
+        // run for their side effects, e.g. `store`), yielding the last's type.
+        let core = if cores.len() == 1 {
+            cores.pop().unwrap()
+        } else {
+            Core::Seq(cores)
+        };
+        Ok((core, last_ty))
+    }
+}
+
+/// An un-interned symbol for elaborator-internal desugarings. The elaborator
+/// resolves heads and variables by name, so no interning is needed.
+fn synth_symbol(name: &str) -> LispVal {
+    LispVal::Symbol(Shared::new(SharedCell::new(crate::Symbol {
+        name: name.to_string(),
+        plist: std::collections::HashMap::new(),
+        value: None,
+        id: 0,
+        is_keyword: false,
+        is_dynamic: false,
+        special_form: None,
+    })))
+}
+
+fn is_sym(v: &LispVal, name: &str) -> bool {
+    matches!(v, LispVal::Symbol(s) if s.borrow().name == name)
+}
+
+/// A branch body as one form. In statement mode (`stmt`) the value is
+/// discarded, so the body is followed by `false` and every branch is `bool`.
+/// An empty body is NIL, i.e. `false`.
+fn branch_body(body: &[LispVal], stmt: bool) -> LispVal {
+    if body.is_empty() {
+        return synth_symbol("FALSE");
+    }
+    let mut v = vec![synth_symbol("PROGN")];
+    v.extend(body.iter().cloned());
+    if stmt {
+        v.push(synth_symbol("FALSE"));
+    }
+    LispVal::list(v)
+}
+
+/// Codegen desugaring of `cond`/`when`/`unless`/`case` to nested `if` (#404),
+/// matching lib/12-control.lisp. A missed branch is NIL, which native code
+/// carries as `false`; so in value position a branch-form compiles only when
+/// every branch is `bool` (otherwise `if` rejects the join and the function
+/// stays interpreted). `case` compiles only for integer literal keys (EQUAL
+/// on int64 is `=`). Mirrored by `hm-desugar-branch` in lib/46-hm-check.lisp.
+fn desugar_branch(head: &str, args: &[LispVal], stmt: bool) -> Result<LispVal, String> {
+    let if_ = |c: LispVal, t: LispVal, e: LispVal| LispVal::list(vec![synth_symbol("IF"), c, t, e]);
+    match head {
+        "WHEN" | "UNLESS" => {
+            let Some(test) = args.first() else {
+                return Err("`when`/`unless` need a condition".to_string());
+            };
+            let body = branch_body(&args[1..], stmt);
+            Ok(if head == "WHEN" {
+                if_(test.clone(), body, synth_symbol("FALSE"))
+            } else {
+                if_(test.clone(), synth_symbol("FALSE"), body)
+            })
+        }
+        "COND" => {
+            let mut acc = synth_symbol("FALSE");
+            for clause in args.iter().rev() {
+                let parts = list_to_vec(clause);
+                let Some(test) = parts.first() else {
+                    return Err("`cond`: empty clause".to_string());
+                };
+                acc = if is_sym(test, "T") {
+                    if parts.len() == 1 {
+                        synth_symbol("TRUE")
+                    } else {
+                        branch_body(&parts[1..], stmt)
+                    }
+                } else if parts.len() == 1 {
+                    // A test-only clause yields the (bool) test value: true.
+                    if_(test.clone(), synth_symbol("TRUE"), acc)
+                } else {
+                    if_(test.clone(), branch_body(&parts[1..], stmt), acc)
+                };
+            }
+            Ok(acc)
+        }
+        "CASE" => {
+            let Some(key) = args.first() else {
+                return Err("`case` needs a key".to_string());
+            };
+            let k = synth_symbol("%CASE-KEY");
+            let eq = |d: &LispVal| -> Result<LispVal, String> {
+                match d {
+                    LispVal::Number(_) => {
+                        Ok(LispVal::list(vec![synth_symbol("="), k.clone(), d.clone()]))
+                    }
+                    _ => Err("`case`: only integer keys compile".to_string()),
+                }
+            };
+            let mut clauses = vec![synth_symbol("COND")];
+            for clause in &args[1..] {
+                let parts = list_to_vec(clause);
+                let Some(sel) = parts.first() else {
+                    return Err("`case`: empty clause".to_string());
+                };
+                let test = if is_sym(sel, "T") || is_sym(sel, "OTHERWISE") {
+                    synth_symbol("T")
+                } else if let LispVal::Cons { .. } = sel {
+                    let mut or = vec![synth_symbol("OR")];
+                    for d in list_to_vec(sel) {
+                        or.push(eq(&d)?);
+                    }
+                    LispVal::list(or)
+                } else {
+                    eq(sel)?
+                };
+                let mut c = vec![test];
+                if parts.len() == 1 {
+                    // `(datum)` with no body yields NIL.
+                    c.push(synth_symbol("FALSE"));
+                } else {
+                    c.extend(parts[1..].iter().cloned());
+                }
+                clauses.push(LispVal::list(c));
+            }
+            let cond = desugar_branch("COND", &list_to_vec(&LispVal::list(clauses))[1..], stmt)?;
+            Ok(LispVal::list(vec![
+                synth_symbol("LET"),
+                LispVal::list(vec![LispVal::list(vec![k, key.clone()])]),
+                cond,
+            ]))
+        }
+        _ => unreachable!("desugar_branch: {head}"),
+    }
+}
+
+/// The builtins [`Cx::elab`] types only in checking mode (#162) — list/pair,
+/// record, variant and string forms with no codegen lowering. In codegen mode
+/// they fall through to the call rule, which reports them as unsupported in
+/// compiled code rather than as unknown functions (#512). Heads with a codegen
+/// arm of their own (`MIN`, `LOGAND`, `COND`, ...) never get here.
+/// `lib/46-hm-check.lisp`'s `$hm-checking-only-builtins` is the portable twin.
+pub(super) fn checking_only_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "CONS"
+            | "CAR"
+            | "FIRST"
+            | "CDR"
+            | "REST"
+            | "LIST"
+            | "NULL"
+            | "NULL?"
+            | "ENDP"
+            | "RECORD-REF"
+            | "RECORD-NEW"
+            | "RECORD-WITH"
+            | "APPEND"
+            | "CONCAT"
+            | "GCD"
+            | "LCM"
+            | "QUOTE"
+            | "VARIANT-CASE"
+    )
+}
+
+/// Rejects `let*` shapes the evaluator's LET* does not accept (#522): it
+/// needs a binding list and a body, and every binding is a `(name init)` pair,
+/// so the typed `(name type init)` shape of `let-typed` does not leak into
+/// `let*` (`elab_let`, which `let*` shares, accepts both).
+/// Mirrored by `hm-check-let-star` in lib/46-hm-check.lisp.
+fn check_let_star(args: &[LispVal]) -> Result<(), String> {
+    if args.len() < 2 || !matches!(args[0], LispVal::Nil | LispVal::Cons { .. }) {
+        return Err("let* requires a binding list and at least one body form".to_string());
+    }
+    for b in list_to_vec(&args[0]) {
+        if !matches!(list_to_vec(&b).as_slice(), [LispVal::Symbol(_), _]) {
+            return Err("let* binding must be a (name init) pair".to_string());
+        }
+    }
+    Ok(())
+}

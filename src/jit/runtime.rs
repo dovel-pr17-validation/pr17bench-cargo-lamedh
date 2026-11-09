@@ -1,0 +1,2516 @@
+use super::*;
+// ---------------------------------------------------------------------------
+// Runtime: interpreter and compiler over unboxed u64 words.
+// ---------------------------------------------------------------------------
+
+/// Call context: the function table (so calls dispatch through the registry
+/// cell) plus the **call arena** that roots every array/struct buffer allocated
+/// during the call. Compound values live as pointers into these `Box<[u64]>`
+/// buffers; the arena (and therefore the buffers) is dropped when the top-level
+/// membrane call returns — after any compound result has been copied out. A
+/// `Box<[u64]>`'s heap data pointer is stable across arena `Vec` growth, so
+/// native code may hold a raw `base` for the duration of a call.
+pub struct Ctx<'a> {
+    pub(super) funcs: &'a [Rc<TypedFn>],
+    pub(super) arena: RefCell<Vec<Box<[u64]>>>,
+    /// Live words currently rooted in `arena` (headers included), and the
+    /// high-water mark of that count over the call (issue #212). The peak is
+    /// published to [`last_call_arena_peak_words`] when a membrane call
+    /// returns, so tests can observe — and bound — per-call arena growth.
+    pub(super) arena_live: Cell<usize>,
+    pub(super) arena_peak: Cell<usize>,
+    /// Set by a compiled/interpreted body, instead of performing the call
+    /// itself, when it reaches a *cross-function* tail call (issue #133
+    /// Tier 2a). `TypedFn::invoke`'s dispatch loop checks this immediately
+    /// after every underlying edition call and, if set, clears it and
+    /// re-dispatches to the named function with the given argument words —
+    /// an explicit, host-driven trampoline (mirrors the tree-walker's
+    /// `TcoStep::TailCall`) that keeps native stack usage O(1) for
+    /// arbitrarily deep mutual/general tail recursion, without adopting
+    /// Cranelift's `tail` calling convention (assessed and deferred — see
+    /// the design note above `compile_native` in `native.rs`). A *self*
+    /// tail call (Tier 1) never touches this: it loops within the callee's
+    /// own edition instead.
+    pub(super) pending_tail: RefCell<Option<(usize, Vec<u64>)>>,
+    /// Set by `int_bin` when a checked integer operation overflows (issue #228).
+    /// The membrane reads this after the call returns and sets the evaluator's
+    /// `OVERFLOW` condition flag.
+    pub(super) overflow: Cell<bool>,
+    /// Set by `int_bin` when integer division or remainder by zero is attempted.
+    /// The membrane reads this and raises a `Division by zero` error.
+    pub(super) div_by_zero: Cell<bool>,
+    /// Non-tail call depth (issue #271). Incremented/decremented by
+    /// [`Ctx::enter_call`]/[`Ctx::exit_call`] around every non-tail call
+    /// reached through [`Ctx::call`] — the interpreter and closure editions'
+    /// own `Core::Call` arms, and any native call that falls through to the
+    /// host trampoline — *and*, via the imported `jit_enter_call`/
+    /// `jit_exit_call` trampolines a native edition calls directly (see
+    /// `native::compile_native`'s `emit_call`), around the direct
+    /// native-to-native `call_indirect` fast path that otherwise never
+    /// touches `Ctx::call` at all. See [`typed_call_depth_limit`] for the limit
+    /// and [`DEFAULT_TYPED_CALL_DEPTH_LIMIT`] for how its default was derived.
+    pub(super) depth: Cell<usize>,
+    /// The non-tail call depth at which [`Ctx::enter_call`] refuses, sampled
+    /// from [`typed_call_depth_limit`] when the `Ctx` is built so the guard
+    /// on the call fast path reads a plain field, not a thread-local.
+    pub(super) max_depth: usize,
+    /// First reachable-error condition recorded during a call that has no
+    /// sensible "keep computing, flag it" resolution the way overflow/div-by-
+    /// zero do (issue #271): an oversized array/struct allocation, the
+    /// non-tail recursion cap, calling a `declare-typed`d-but-never-defined
+    /// function, or a stale-arity call site left over by an arity-changing
+    /// redefinition. Every site that would otherwise panic instead records a
+    /// message here (first one wins, matching the tree-walker's left-to-right
+    /// evaluation order) and returns a memory-safe substitute value (a
+    /// zero-length arena buffer — a valid, non-null pointer that is also a
+    /// harmless word if the caller treats it as a scalar) so execution can run
+    /// to completion; the membrane checks this after the top-level call
+    /// returns and raises it as a Lisp error in place of the (meaningless)
+    /// result, exactly as `div_by_zero` already does for its one fixed
+    /// message.
+    pub(super) pending_error: RefCell<Option<String>>,
+    /// The root table backing [`Ty::Boxed`] handles (issue #476): a
+    /// call-scoped, append-only table of cloned `LispVal`s. A handle word is
+    /// a 1-based index into this table (word `0` means `NIL` without a table
+    /// slot); see the doc comment on `Ty::Boxed` for the full representation
+    /// and aliasing contract. Dropped with the rest of `Ctx` when the
+    /// top-level membrane call returns.
+    pub(super) boxed: RefCell<Vec<LispVal>>,
+    /// Whether this call runs under an armed kernel fuel budget (issue
+    /// #502), sampled when the `Ctx` is built. A metered call never enters
+    /// a native or closure edition — their internal loops never return to
+    /// any metering point — and instead runs the reference interpreter
+    /// ([`eval_core`]), which charges one kernel fuel step per loop
+    /// iteration, self tail call and function entry (see
+    /// [`Ctx::charge_fuel`]).
+    pub(super) metered: bool,
+    /// Set once a metered call has spent the budget: every loop and call
+    /// then unwinds promptly, and the membrane reports
+    /// [`FUEL_EXHAUSTED`] in place of the result.
+    pub(super) fuel_out: Cell<bool>,
+}
+
+/// The pending-error message a metered typed call records when the kernel
+/// fuel budget runs out (issue #502). The evaluator's typed membrane maps it
+/// back to `LispError::FuelExhausted`, so the owning `WITH-FUEL` fence (or
+/// the `--fuel`/`--mcp` toplevel) sees exactly the signal the tree-walker
+/// raises.
+pub const FUEL_EXHAUSTED: &str = "fuel exhausted (kernel step budget)";
+
+/// Default non-tail call depth for typed (compiled) code, per thread.
+///
+/// Sized for the 512 MiB `with_large_stack` thread (2 KiB per interpreted or
+/// closure frame, about 100 MiB at the limit; derivation below). A `wasm32`
+/// host runs on a stack it does not own (V8's, roughly 1 MiB), where 50,000
+/// frames overflow it long before the cap can fire and the instance traps, so
+/// the default there is far smaller.
+///
+/// Arithmetic: the evaluator thread runs under [`crate::with_large_stack`],
+/// a 512 MiB stack (`INTERPRETER_STACK_SIZE`). The interpreter/closure
+/// editions reached through [`Ctx::call`] recurse as ordinary Rust calls —
+/// `eval_core`/`eval_core_nontail`'s own frame plus the per-call `Vec<u64>`
+/// argument buffer and the callee's fresh `env` `Vec` — call it a generous
+/// 2 KiB/frame upper bound (smaller than, but the same order of magnitude
+/// as, the tree-walker's own per-`eval`-frame budget behind
+/// `DEFAULT_EVAL_DEPTH_LIMIT`, since typed-core frames do far less
+/// per-node bookkeeping). A native frame guarded via
+/// `jit_enter_call`/`jit_exit_call` is far smaller still (a handful of
+/// 8-byte stack slots), so the same cap is comfortably conservative
+/// there too. `DEFAULT_TYPED_CALL_DEPTH_LIMIT * 2 KiB` ≈ 100 MiB, leaving well over
+/// 400 MiB of headroom in the 512 MiB budget for the rest of the call
+/// chain that led to this typed call (evaluator frames, other typed calls
+/// already on the stack, …) — generous enough not to trip on realistic
+/// recursive typed programs, small enough to trip long before the stack
+/// is actually exhausted.
+#[cfg(not(target_arch = "wasm32"))]
+pub const DEFAULT_TYPED_CALL_DEPTH_LIMIT: usize = 50_000;
+/// See the non-wasm32 constant of the same name.
+#[cfg(target_arch = "wasm32")]
+pub const DEFAULT_TYPED_CALL_DEPTH_LIMIT: usize = 400;
+
+thread_local! {
+    static TYPED_CALL_DEPTH_LIMIT: Cell<usize> =
+        const { Cell::new(DEFAULT_TYPED_CALL_DEPTH_LIMIT) };
+}
+
+/// Set the non-tail call depth at which typed (compiled) code signals a
+/// recursion-limit error, for the current thread. It is separate from
+/// [`crate::set_eval_depth_limit`], which bounds the tree-walking evaluator
+/// and does not see calls inside typed code. Calls already running keep the
+/// limit they started with; the new value applies to the next top-level typed
+/// call. A host with a small native stack (wasm32 in a browser) must keep
+/// this below what that stack holds.
+pub fn set_typed_call_depth_limit(limit: usize) {
+    TYPED_CALL_DEPTH_LIMIT.with(|l| l.set(limit));
+}
+
+/// The current thread's typed-call depth limit; see
+/// [`set_typed_call_depth_limit`].
+pub fn typed_call_depth_limit() -> usize {
+    TYPED_CALL_DEPTH_LIMIT.with(|l| l.get())
+}
+
+impl Ctx<'_> {
+    /// Byte offset of the `overflow` field from the start of `Ctx`.
+    /// Used by native codegen to store the flag without branches — hence
+    /// dead (and cfg-gated) when the Cranelift `jit` feature is off.
+    #[cfg(feature = "jit")]
+    pub(super) const OVERFLOW_OFFSET: usize = std::mem::offset_of!(Ctx<'_>, overflow);
+    /// Byte offset of the `div_by_zero` field from the start of `Ctx`.
+    #[cfg(feature = "jit")]
+    pub(super) const DIV_BY_ZERO_OFFSET: usize = std::mem::offset_of!(Ctx<'_>, div_by_zero);
+
+    /// Record `msg` as the pending error for this call, unless one is already
+    /// recorded — first error wins, matching the tree-walker's left-to-right
+    /// evaluation order (and the existing overflow-before-div-by-zero
+    /// ordering, issue #228).
+    pub(super) fn set_pending_error(&self, msg: String) {
+        let mut slot = self.pending_error.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(msg);
+        }
+    }
+
+    /// Enter a non-tail call: bump the depth counter, or refuse — recording a
+    /// recursion-limit [`pending_error`](Ctx::pending_error) — if already at
+    /// [`Ctx::max_depth`]. Returns `true` on success; a successful
+    /// `enter_call` must be paired with exactly one [`Ctx::exit_call`] once
+    /// the call returns.
+    ///
+    /// Once any error is pending, every further call is refused too: the
+    /// result is already discarded (the membrane raises the error instead and
+    /// skips write-back), and the tree-walker would have stopped at the first
+    /// error. Without this, frames below the cap keep calling — naive `fib`
+    /// past the cap is exponential work that never finishes (#512).
+    pub(super) fn enter_call(&self) -> bool {
+        let d = self.depth.get();
+        if self.pending_error.borrow().is_some() {
+            false
+        } else if d >= self.max_depth {
+            self.set_pending_error(format!(
+                "recursion limit exceeded ({} non-tail typed calls); rewrite as a tail call or iteratively",
+                self.max_depth
+            ));
+            false
+        } else {
+            self.depth.set(d + 1);
+            true
+        }
+    }
+
+    /// Charge one kernel fuel step for a metered call (issue #502); always
+    /// `true` for an unmetered one. Returns `false` once the budget is
+    /// spent, after recording [`FUEL_EXHAUSTED`] as the pending error — it
+    /// overrides any earlier pending error, because exhaustion is a
+    /// control-flow signal the owning fence must see, not an ordinary
+    /// condition. Callers stop looping / return a memory-safe substitute.
+    #[inline]
+    pub(super) fn charge_fuel(&self) -> bool {
+        if !self.metered {
+            return true;
+        }
+        if self.fuel_out.get() {
+            return false;
+        }
+        if crate::evaluator::core::charge_kernel_fuel().is_err() {
+            self.fuel_out.set(true);
+            *self.pending_error.borrow_mut() = Some(FUEL_EXHAUSTED.to_string());
+            return false;
+        }
+        true
+    }
+
+    /// Leave a non-tail call entered via [`Ctx::enter_call`].
+    pub(super) fn exit_call(&self) {
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
+
+    #[inline]
+    pub(super) fn call(&self, id: usize, args: &[u64]) -> u64 {
+        if !self.enter_call() {
+            // Memory-safe substitute: a valid (non-null) pointer to a
+            // zero-length buffer, harmless whether the caller treats the
+            // result as a scalar word or as an array/struct pointer. The
+            // membrane discards it once it sees `pending_error` set.
+            return self.alloc_buffer(0) as u64;
+        }
+        let r = self.funcs[id].invoke(args, self);
+        self.exit_call();
+        r
+    }
+
+    /// Root `buf` in the arena, keeping the live/peak word accounting current.
+    fn root_buffer(&self, buf: Box<[u64]>) {
+        let live = self.arena_live.get() + buf.len();
+        self.arena_live.set(live);
+        if live > self.arena_peak.get() {
+            self.arena_peak.set(live);
+        }
+        self.arena.borrow_mut().push(buf);
+    }
+
+    /// The arena's current length: a *mark* to hand back to
+    /// [`Ctx::arena_reclaim`] (issue #212).
+    pub(super) fn arena_mark(&self) -> usize {
+        self.arena.borrow().len()
+    }
+
+    /// Free every buffer rooted after `mark` (issue #212).
+    ///
+    /// # Soundness contract
+    ///
+    /// The caller must guarantee that no live value — a local, an argument
+    /// word, a pending tail-call argument, or a cell of any buffer rooted at
+    /// or before `mark` — holds a pointer into a buffer rooted after `mark`.
+    /// The tail-loop edges establish that only for functions whose parameters
+    /// and return are all scalar ([`Ty::is_reclaim_scalar`]): a scalar word
+    /// is never an arena pointer, and with no compound parameter there is no
+    /// older buffer a fresh buffer could be stored into.
+    pub(super) fn arena_reclaim(&self, mark: usize) {
+        let mut arena = self.arena.borrow_mut();
+        if arena.len() > mark {
+            let freed: usize = arena[mark..].iter().map(|b| b.len()).sum();
+            // Debug aid: poison freed words so a use-after-free in a test
+            // reads 0xDEAD.. instead of plausible stale data.
+            #[cfg(test)]
+            for b in arena[mark..].iter_mut() {
+                b.fill(0xDEAD_DEAD_DEAD_DEAD);
+            }
+            arena.truncate(mark);
+            self.arena_live.set(self.arena_live.get() - freed);
+        }
+    }
+
+    /// Allocate an `n`-element buffer `[n, 0, 0, …]` in the arena and return a
+    /// raw pointer to its header word. The arena owns the `Box`, keeping the
+    /// data pointer valid (and stable) until the call returns.
+    ///
+    /// `n` over the limit (issue #271; reachable from `jit_alloc` with a
+    /// Cranelift-computed `n` — a negative array-size expression reinterprets
+    /// as a huge `usize`) no longer asserts: it records a
+    /// [`pending_error`](Ctx::pending_error) mirroring the evaluator's own
+    /// `MakeArray` over-limit message (`src/evaluator/apply.rs`) and falls
+    /// back to a zero-length allocation, which keeps every bounds-checked
+    /// buffer access (`buf_get`/`buf_set`) safe for the rest of the call; the
+    /// membrane raises the recorded error once the call returns.
+    pub(super) fn alloc_buffer(&self, n: usize) -> *mut u64 {
+        const MAX_ELEMENTS: usize = 16 * 1024 * 1024; // 16 M — same cap as interpreted (array)
+        let n = if n > MAX_ELEMENTS {
+            self.set_pending_error(format!("array: size {n} exceeds maximum of {MAX_ELEMENTS}"));
+            0
+        } else {
+            n
+        };
+        let mut buf = vec![0u64; n + 1].into_boxed_slice();
+        buf[0] = n as u64;
+        let ptr = buf.as_mut_ptr();
+        self.root_buffer(buf);
+        ptr
+    }
+
+    /// [`Ctx::alloc_buffer`] for a *signed* element count, as computed by
+    /// typed code. A negative size records the evaluator's own
+    /// "non-negative integer" `ARRAY` error (issue #271 — the interpreter and
+    /// tracing tiers used to clamp negatives to 0 silently, while the native
+    /// tier reinterpreted them as huge unsigned sizes; all three now agree
+    /// with the tree-walker) and falls back to a zero-length allocation.
+    pub(super) fn alloc_buffer_signed(&self, n: i64) -> *mut u64 {
+        if n < 0 {
+            self.set_pending_error(format!(
+                "ARRAY: size must be a non-negative integer, got {n}"
+            ));
+            return self.alloc_buffer(0);
+        }
+        self.alloc_buffer(n as usize)
+    }
+
+    /// [`Ctx::alloc_buffer`]'s counterpart for the inline (contiguous
+    /// array-of-structs) layout (jit/core-loops follow-up, [`Core::ArrayNewStride`]):
+    /// allocate `n*stride + 1` words — `n` inline `stride`-word elements
+    /// plus the header — but the header word is still the *element* count
+    /// `n` (not the total word count), matching `alloc_buffer`'s contract so
+    /// `ArrayLen` needs no special-casing for this layout. A negative `n`
+    /// records the same "non-negative integer" error as
+    /// [`Ctx::alloc_buffer_signed`]; an `n*stride` overflow or over-the-cap
+    /// size records the same over-limit error as [`Ctx::alloc_buffer`] —
+    /// both fall back to a zero-length allocation so every bounds-checked
+    /// access downstream stays memory-safe.
+    pub(super) fn alloc_buffer_stride(&self, n: i64, stride: usize) -> *mut u64 {
+        if n < 0 {
+            self.set_pending_error(format!(
+                "ARRAY: size must be a non-negative integer, got {n}"
+            ));
+            return self.alloc_buffer(0);
+        }
+        const MAX_ELEMENTS: usize = 16 * 1024 * 1024; // matches Ctx::alloc_buffer's cap
+        let total_words = (n as usize)
+            .checked_mul(stride)
+            .and_then(|w| w.checked_add(1));
+        let total_words = match total_words {
+            Some(w) if (n as usize) <= MAX_ELEMENTS => w,
+            _ => {
+                self.set_pending_error(format!(
+                    "array: size {n} exceeds maximum of {MAX_ELEMENTS}"
+                ));
+                return self.alloc_buffer(0);
+            }
+        };
+        let mut buf = vec![0u64; total_words].into_boxed_slice();
+        buf[0] = n as u64;
+        let ptr = buf.as_mut_ptr();
+        self.root_buffer(buf);
+        ptr
+    }
+
+    /// Record the evaluator's own out-of-range array-index error for a
+    /// bounds-check that failed on `FETCH`/`STORE` (issue #282). The typed
+    /// tiers used to bounds-check and then silently substitute (fetch → 0,
+    /// store → no-op); the tree-walker (`src/evaluator/apply.rs`, `ArrayFetch`/
+    /// `ArrayStore`) instead errors, distinguishing a negative index from an
+    /// in-range-sign-but-past-the-end index. This records the matching message
+    /// (`is_store` picks the `STORE`/`store` vs `FETCH`/`fetch` wording exactly
+    /// as the evaluator spells it) as a [`pending_error`](Ctx::pending_error);
+    /// the caller still returns the memory-safe substitute so the rest of the
+    /// call stays panic-free, and the membrane raises the recorded error once
+    /// the call returns.
+    pub(super) fn record_index_error(&self, idx: i64, len: i64, is_store: bool) {
+        if idx < 0 {
+            let who = if is_store { "STORE" } else { "FETCH" };
+            self.set_pending_error(format!(
+                "{who}: index must be a non-negative integer, got {idx}"
+            ));
+        } else {
+            let who = if is_store { "store" } else { "fetch" };
+            self.set_pending_error(format!("{who}: index {idx} out of bounds (length {len})"));
+        }
+    }
+
+    /// Record the CODE-CHAR out-of-range error (issue #281). The typed
+    /// island's `char` is deliberately a byte (`(array char)` == string, #137),
+    /// so `CODE-CHAR` can only represent code points `0..=255`. Rather than
+    /// silently masking an out-of-range argument to a byte (a #209-direction
+    /// silent wrong value: `(code-char 321)` used to yield `#\A`), it records
+    /// an error, matching the evaluator's error-on-invalid contract where
+    /// representable. A negative argument reuses the evaluator's own
+    /// "non-negative integer" wording (`src/evaluator/builtins_core.rs`,
+    /// `CodeChar`); an argument above 255 — which the evaluator *does* accept,
+    /// returning a multi-byte string the typed island cannot represent — gets a
+    /// typed-island-specific range message (the residual, documented deviation:
+    /// the typed island narrows CODE-CHAR's domain to a byte).
+    pub(super) fn record_bad_char(&self, n: i64) {
+        if n < 0 {
+            self.set_pending_error(format!(
+                "CODE-CHAR: expected a non-negative integer, got {n}"
+            ));
+        } else {
+            self.set_pending_error(format!(
+                "CODE-CHAR: code point {n} is outside the typed char range 0-255"
+            ));
+        }
+    }
+
+    /// Narrow an integer word to a `char` byte for `CODE-CHAR` (issue #281):
+    /// an out-of-range argument records [`Ctx::record_bad_char`] and the value
+    /// is still masked to a byte as the memory-safe substitute (a valid `char`)
+    /// so the rest of the call runs; the membrane raises the recorded error
+    /// once the call returns. Used by the interpreter and closure tiers; the
+    /// native tier does the range check inline and calls the
+    /// [`jit_bad_char`] trampoline on the out-of-range arm.
+    pub(super) fn to_char(&self, n: i64) -> u64 {
+        if !(0..=255).contains(&n) {
+            self.record_bad_char(n);
+        }
+        (n as u64) & 0xff
+    }
+
+    /// Record a pending cross-function tail call for `TypedFn::invoke`'s
+    /// dispatch loop to pick up, instead of performing it here. `args` is
+    /// copied immediately, so the caller's argument buffer (a Cranelift
+    /// stack slot, or a `Vec` about to be dropped) need not outlive this call.
+    pub(super) fn set_pending_tail(&self, id: usize, args: &[u64]) {
+        *self.pending_tail.borrow_mut() = Some((id, args.to_vec()));
+    }
+
+    /// Take (clear) any pending tail call recorded since the last check.
+    pub(super) fn take_pending_tail(&self) -> Option<(usize, Vec<u64>)> {
+        self.pending_tail.borrow_mut().take()
+    }
+
+    /// Box `lv` into this call's root table (issue #476), returning its
+    /// 1-based handle word. `NIL` shortcuts to `0` and takes no table slot —
+    /// see [`Ty::Boxed`]'s doc comment for why. O(1): the value is cloned
+    /// (cheap for every `LispVal` variant — `Shared`-backed ones bump a
+    /// refcount) and pushed, never inspected or copied element-wise.
+    pub(super) fn box_value(&self, lv: LispVal) -> u64 {
+        if matches!(lv, LispVal::Nil) {
+            return 0;
+        }
+        let mut table = self.boxed.borrow_mut();
+        table.push(lv);
+        table.len() as u64
+    }
+
+    /// Resolve a boxed handle word back to its `LispVal` (issue #476). Word
+    /// `0` is `NIL`. An out-of-range index — which should never happen from
+    /// well-typed code, but a malformed/adversarial word must not panic —
+    /// records a [`pending_error`](Ctx::pending_error) and returns `NIL` as
+    /// the memory-safe substitute, matching every other fallible `Ctx`
+    /// operation's discipline.
+    pub(super) fn unbox(&self, w: u64) -> LispVal {
+        if w == 0 {
+            return LispVal::Nil;
+        }
+        let table = self.boxed.borrow();
+        match table.get((w - 1) as usize) {
+            Some(lv) => lv.clone(),
+            None => {
+                drop(table);
+                self.set_pending_error(format!(
+                    "boxed: handle {w} out of range (table has {} entr{})",
+                    self.boxed.borrow().len(),
+                    if self.boxed.borrow().len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                ));
+                LispVal::Nil
+            }
+        }
+    }
+
+    /// Record the evaluator's own "expects an array" type error for a boxed
+    /// receiver that turned out not to be a `LispVal::Array` when a
+    /// [`BoxedOp::Aref`]/[`BoxedOp::Aset`]/[`BoxedOp::Len`] tried to look
+    /// inside it (issue #476). `who` is the operation's own spelling
+    /// (`"FETCH"`/`"STORE"`/`"ARRAY-LENGTH*"`), and the message must match the
+    /// tree-walker's own wording for the same misuse verbatim: `FETCH`/`STORE`
+    /// (`apply.rs:1713,1761`) say "first argument", but `ARRAY-LENGTH*`
+    /// (`apply.rs:1776`) says just "argument" — no "first", since it takes
+    /// only one. Hard-coding "first" for all three would make the boxed path
+    /// diverge from the plain `(array-length* 5)` misuse text.
+    fn record_boxed_not_array(&self, who: &str, got: &LispVal) {
+        let article = if who == "ARRAY-LENGTH*" {
+            "argument"
+        } else {
+            "first argument"
+        };
+        self.set_pending_error(format!(
+            "{who}: {article} must be an array, got {}",
+            crate::printer::print(got)
+        ));
+    }
+
+    /// A `Ctx` for a *leaf* native call from a raw entry point (issue #424).
+    /// The function table is empty: a leaf's native code never performs a
+    /// cross-function call, so it never indexes `funcs` — the only `Ctx` state
+    /// it touches is the flag bytes (`overflow`/`div_by_zero`), the arena
+    /// allocator hook, and the out-of-bounds/`code-char` reporters, all of
+    /// which are self-contained per call. Built fresh on the caller's stack for
+    /// every raw-entry call, so calls from any thread are independent and need
+    /// no shared state.
+    #[cfg(feature = "jit")]
+    pub(super) fn leaf() -> Ctx<'static> {
+        Ctx {
+            funcs: &[],
+            arena: RefCell::new(Vec::new()),
+            arena_live: Cell::new(0),
+            arena_peak: Cell::new(0),
+            pending_tail: RefCell::new(None),
+            overflow: Cell::new(false),
+            div_by_zero: Cell::new(false),
+            depth: Cell::new(0),
+            // A leaf never calls across functions, so the cap is moot.
+            max_depth: DEFAULT_TYPED_CALL_DEPTH_LIMIT,
+            pending_error: RefCell::new(None),
+            boxed: RefCell::new(Vec::new()),
+            // Raw entries are documented as unmetered (see `entry.rs`).
+            metered: false,
+            fuel_out: Cell::new(false),
+        }
+    }
+
+    /// Drain this call's error state into a single message, first-match wins,
+    /// mirroring the membrane's own ordering (`call_inner`): a reachable-error
+    /// condition (oversized allocation, out-of-bounds access, `code-char`
+    /// range) first, then integer overflow, then division by zero. `None` when
+    /// the call completed cleanly. Used by [`NativeFnHandle`](super::entry::NativeFnHandle)
+    /// to expose a `last_error()` after a raw-entry call, which — unlike the
+    /// membrane — does not propagate these to the Lisp condition system.
+    #[cfg(feature = "jit")]
+    pub(super) fn native_error(&self) -> Option<String> {
+        if let Some(msg) = self.pending_error.borrow_mut().take() {
+            return Some(msg);
+        }
+        if self.overflow.get() {
+            return Some("integer overflow".to_string());
+        }
+        if self.div_by_zero.get() {
+            return Some("division by zero".to_string());
+        }
+        None
+    }
+}
+
+thread_local! {
+    static LAST_CALL_ARENA_PEAK_WORDS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Peak number of `u64` words simultaneously rooted in the call arena during
+/// the most recent top-level membrane call on this thread (issue #212).
+/// Stack-allocated buffers and the boxed-handle table are not counted.
+pub fn last_call_arena_peak_words() -> usize {
+    LAST_CALL_ARENA_PEAK_WORDS.with(Cell::get)
+}
+
+pub(super) fn publish_arena_peak(words: usize) {
+    LAST_CALL_ARENA_PEAK_WORDS.with(|c| c.set(words));
+}
+
+/// Host helpers for the native self-tail-call edge (issue #212): capture the
+/// arena length at function entry, and free everything rooted after it.
+///
+/// # Safety: as [`jit_alloc`].
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_arena_mark(ctx: *const core::ffi::c_void) -> u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.arena_mark() as u64
+}
+
+/// # Safety: as [`jit_alloc`]; the [`Ctx::arena_reclaim`] contract applies.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_arena_reclaim(ctx: *const core::ffi::c_void, mark: u64) {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.arena_reclaim(mark as usize);
+}
+
+/// Host trampoline for in-native array/struct allocation: allocate an
+/// `n`-element buffer in the call arena and return its header pointer.
+///
+/// # Safety
+/// Called only from Cranelift-generated code with the `ctx` pointer threaded
+/// from the native entry; `ctx` must point to the live [`Ctx`] for the call.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_alloc(ctx: *const core::ffi::c_void, n: u64) -> *mut u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    // `n` is a typed-code (signed) element count that crossed the ABI as a
+    // word; reinterpret it back so a negative size gets the evaluator's
+    // "non-negative integer" error instead of becoming a huge unsigned size.
+    ctx.alloc_buffer_signed(n as i64)
+}
+
+/// [`jit_alloc`]'s counterpart for the inline (contiguous array-of-structs)
+/// layout ([`Core::ArrayNewStride`]): allocate an `n`-element buffer of
+/// `stride` words each and return its header pointer.
+///
+/// # Safety: as [`jit_alloc`].
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_alloc_stride(
+    ctx: *const core::ffi::c_void,
+    n: u64,
+    stride: u64,
+) -> *mut u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.alloc_buffer_stride(n as i64, stride as usize)
+}
+
+/// Host trampoline the native edition calls from the out-of-bounds arm of a
+/// guarded `FETCH`/`STORE` (issue #282): records the evaluator's own index
+/// error on `Ctx` so the membrane raises it after the call returns, mirroring
+/// the interpreter tiers' `buf_get`/`buf_set`. The native code still produces
+/// its memory-safe substitute (fetch → 0, store → no-op); only the else-arm
+/// grew this call. `is_store` is a word carrying a bool (0 = fetch, 1 = store).
+///
+/// # Safety
+/// Called only from Cranelift-generated code with the `ctx` pointer threaded
+/// from the native entry.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_array_oob(
+    ctx: *const core::ffi::c_void,
+    idx: i64,
+    len: i64,
+    is_store: u64,
+) {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.record_index_error(idx, len, is_store != 0);
+}
+
+/// Host trampoline the native edition calls from the out-of-range arm of a
+/// `CODE-CHAR` narrowing (issue #281): records the CODE-CHAR range error on
+/// `Ctx` so the membrane raises it after the call returns, mirroring the
+/// interpreter tiers' [`Ctx::to_char`]. The native code still masks the value
+/// to a byte itself; only the error is recorded here.
+///
+/// # Safety
+/// Called only from Cranelift-generated code with the `ctx` pointer threaded
+/// from the native entry.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_bad_char(ctx: *const core::ffi::c_void, n: i64) {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.record_bad_char(n);
+}
+
+/// Host trampoline for the libm float intrinsics (`sin`/`cos`/`tan`/`exp`/
+/// `round`) that have no direct Cranelift instruction. `op` is the [`FUnOp`]
+/// discriminant; `x` is the float argument. Returns the result as a raw word
+/// (float bits for the transcendentals, the integer value for `round`),
+/// exactly matching [`FUnOp::apply_word`] — which is literally what it calls,
+/// so the native path and the Core interpreter can never diverge. Pure math:
+/// no `Ctx`, no unsafe.
+#[cfg(feature = "jit")]
+pub(crate) extern "C" fn jit_ftrans(op: u64, x: f64) -> u64 {
+    super::types::FUnOp::from_opcode(op).apply_word(x)
+}
+
+/// Host trampoline for the binary float intrinsics (#398): `op` is the
+/// [`super::types::FBinOp`] discriminant, `x`/`y` the raw operand words.
+/// Calls [`super::types::FBinOp::apply_word`], exactly what the Core
+/// interpreter and closure tier call.
+#[cfg(feature = "jit")]
+pub(crate) extern "C" fn jit_ftrans2(op: u64, x: u64, y: u64) -> u64 {
+    super::types::FBinOp::from_opcode(op).apply_word(x, y)
+}
+
+/// Host trampoline for the boxed-handle intrinsics (issue #476 phase 3b/3c):
+/// `op` is the [`BoxedOp`] discriminant, `a`/`b`/`c` the raw argument words
+/// (unused positions are ignored — see [`BoxedOp`]'s doc comment for which
+/// apply to which op). Calls [`boxed_op`] directly, the single evaluator the
+/// Core interpreter and closure edition also call, so native code can never
+/// diverge from the other two tiers.
+///
+/// # Safety
+/// Called only from Cranelift-generated code with the `ctx` pointer threaded
+/// from the native entry.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_boxed_op(
+    ctx: *const core::ffi::c_void,
+    op: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+) -> u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    boxed_op(super::types::BoxedOp::from_opcode(op), a, b, c, ctx)
+}
+
+/// Host trampoline a native edition calls immediately before making a
+/// non-tail call (issue #271): mirrors [`Ctx::enter_call`] for the direct
+/// native-to-native `call_indirect` fast path, which otherwise never reaches
+/// [`Ctx::call`] and so would recurse with no depth guard at all. Returns
+/// nonzero (call is allowed; the depth counter has been bumped) or zero (the
+/// depth cap was hit; a recursion-limit error is now pending and the native
+/// caller must skip the call, substituting `jit_alloc(ctx, 0)` for its value).
+///
+/// # Safety
+/// Called only from Cranelift-generated code with the `ctx` pointer threaded
+/// from the native entry.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_enter_call(ctx: *const core::ffi::c_void) -> u64 {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.enter_call() as u64
+}
+
+/// Host trampoline a native edition calls after a non-tail call it guarded
+/// with [`jit_enter_call`] returns — the native-side counterpart of
+/// [`Ctx::exit_call`].
+///
+/// # Safety
+/// As [`jit_enter_call`].
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_exit_call(ctx: *const core::ffi::c_void) {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.exit_call();
+}
+
+/// Host trampoline the native edition calls from the zero-step arm of a
+/// `Core::For` loop: records the tree-walker's own "for step must be
+/// non-zero" error (`special_forms.rs::eval_for`) on `Ctx` so the membrane
+/// raises it after the call returns. The native code still skips the loop
+/// entirely; this only records the error.
+///
+/// # Safety
+/// Called only from Cranelift-generated code with the `ctx` pointer threaded
+/// from the native entry.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_for_step_zero(ctx: *const core::ffi::c_void) {
+    let ctx = unsafe { &*(ctx as *const Ctx) };
+    ctx.set_pending_error("for step must be non-zero".to_string());
+}
+
+pub(super) fn int_bin(op: BinOp, x: i64, y: i64, ctx: &Ctx) -> i64 {
+    match op {
+        BinOp::Add => match x.checked_add(y) {
+            Some(v) => v,
+            None => {
+                ctx.overflow.set(true);
+                x.wrapping_add(y)
+            }
+        },
+        BinOp::Sub => match x.checked_sub(y) {
+            Some(v) => v,
+            None => {
+                ctx.overflow.set(true);
+                x.wrapping_sub(y)
+            }
+        },
+        BinOp::Mul => match x.checked_mul(y) {
+            Some(v) => v,
+            None => {
+                ctx.overflow.set(true);
+                x.wrapping_mul(y)
+            }
+        },
+        BinOp::Div => {
+            if y == 0 {
+                ctx.div_by_zero.set(true);
+                0
+            } else if x == i64::MIN && y == -1 {
+                ctx.overflow.set(true);
+                x.wrapping_div(y)
+            } else {
+                x / y
+            }
+        }
+        BinOp::Mod => {
+            if y == 0 {
+                ctx.div_by_zero.set(true);
+                0
+            } else {
+                // Euclidean modulo, matching the evaluator's MOD — a
+                // deliberate PR #112 design (REMAINDER is the truncated op):
+                // (mod -7 3) = 2, and the result sign follows the divisor's
+                // magnitude space, never the dividend. checked_rem_euclid
+                // handles MIN % -1 (mathematically 0; the intermediate
+                // overflows, so it returns None): the evaluator answers 0
+                // with NO flag, so the typed tiers must too — this
+                // supersedes the OVERFLOW flag #228/#268 set here on the
+                // mistaken assumption that MOD was the truncated op (#280).
+                x.checked_rem_euclid(y).unwrap_or(0)
+            }
+        }
+        // Truncated remainder, matching the evaluator's REMAINDER (#522):
+        // MIN rem -1 is 0 and, unlike MOD, sets OVERFLOW there.
+        BinOp::Rem => {
+            if y == 0 {
+                ctx.div_by_zero.set(true);
+                0
+            } else if x == i64::MIN && y == -1 {
+                ctx.overflow.set(true);
+                x.wrapping_rem(y)
+            } else {
+                x % y
+            }
+        }
+        // Pure bitwise: exact match to the evaluator's i64 ops, no flags.
+        BinOp::BitAnd => x & y,
+        BinOp::BitOr => x | y,
+        BinOp::BitXor => x ^ y,
+        // Shifts: `y` is a compile-time constant in 1..=63 (the elaborator only
+        // emits these for a literal in-range `ash`), so the amount never
+        // masks. A left shift sets OVERFLOW exactly when bits are lost (the
+        // shift back does not recover `x`), matching the evaluator's `ash`
+        // (#514).
+        BinOp::Shl => {
+            let v = x.wrapping_shl(y as u32);
+            if (v >> (y as u32)) != x {
+                ctx.overflow.set(true);
+            }
+            v
+        }
+        BinOp::AShr => x >> (y as u32),
+    }
+}
+
+pub(super) fn float_bin(op: BinOp, x: f64, y: f64) -> f64 {
+    match op {
+        BinOp::Add => x + y,
+        BinOp::Sub => x - y,
+        BinOp::Mul => x * y,
+        BinOp::Div => x / y,
+        BinOp::Mod | BinOp::Rem => x % y,
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::AShr => {
+            unreachable!("bitwise/shift ops are int64-only")
+        }
+    }
+}
+
+pub(super) fn int_cmp(op: CmpOp, x: i64, y: i64) -> bool {
+    match op {
+        CmpOp::Lt => x < y,
+        CmpOp::Gt => x > y,
+        CmpOp::Le => x <= y,
+        CmpOp::Ge => x >= y,
+        CmpOp::Eq => x == y,
+        CmpOp::Ne => x != y,
+    }
+}
+
+pub(super) fn float_cmp(op: CmpOp, x: f64, y: f64) -> bool {
+    match op {
+        CmpOp::Lt => x < y,
+        CmpOp::Gt => x > y,
+        CmpOp::Le => x <= y,
+        CmpOp::Ge => x >= y,
+        CmpOp::Eq => x == y,
+        CmpOp::Ne => x != y,
+    }
+}
+
+// --- flat-buffer access shared by the interpreter and closure backends ------
+// All compound values are a pointer to a `[len, e0, e1, …]` buffer. Access is
+// bounds-checked to stay panic-free and to agree with the native edition's
+// guarded loads/stores. An out-of-range index records the evaluator's own
+// index error (issue #282) and still returns a memory-safe substitute (fetch →
+// 0, store → no-op) so the rest of the call runs; the membrane raises the
+// recorded error once the call returns.
+
+/// # Safety: `base` must be a live buffer pointer from [`Ctx::alloc_buffer`].
+#[inline]
+unsafe fn buf_get(base: u64, idx: i64, ctx: &Ctx) -> u64 {
+    let p = base as *const u64;
+    let len = unsafe { *p } as i64;
+    if idx < 0 || idx >= len {
+        ctx.record_index_error(idx, len, false);
+        0
+    } else {
+        unsafe { *p.add(idx as usize + 1) }
+    }
+}
+/// # Safety: as [`buf_get`].
+#[inline]
+unsafe fn buf_set(base: u64, idx: i64, val: u64, ctx: &Ctx) {
+    let p = base as *mut u64;
+    let len = unsafe { *p } as i64;
+    if idx >= 0 && idx < len {
+        unsafe { *p.add(idx as usize + 1) = val }
+    } else {
+        ctx.record_index_error(idx, len, true);
+    }
+}
+/// # Safety: as [`buf_get`].
+#[inline]
+unsafe fn field_get(base: u64, idx: usize) -> u64 {
+    unsafe { *(base as *const u64).add(idx + 1) }
+}
+/// # Safety: as [`buf_get`].
+#[inline]
+unsafe fn field_set(base: u64, idx: usize, val: u64) {
+    unsafe { *(base as *mut u64).add(idx + 1) = val }
+}
+
+// --- boxed-handle intrinsics shared by all three tiers (issue #476) --------
+
+/// The single source of truth for [`BoxedOp`] (issue #476 phase 3b/3c): the
+/// Core interpreter ([`eval_core_nontail`]/[`eval_core_traced`]), the closure
+/// edition ([`compile`]), and native code (via the `jit_boxed_op` trampoline,
+/// `native.rs`) all call this directly, so the three tiers can never diverge
+/// on `equal`/`hash-code`/general-array access over a handle — exactly the
+/// role [`FUnOp::apply_word`] plays for the float intrinsics.
+///
+/// `a`/`b`/`c` are raw handle/int64 words; which ones a given `op` reads is
+/// documented on [`BoxedOp`]'s variants (unused positions are ignored, so
+/// callers may pass `0`).
+pub(super) fn boxed_op(op: BoxedOp, a: u64, b: u64, c: u64, ctx: &Ctx) -> u64 {
+    match op {
+        BoxedOp::Equal => {
+            let (la, lb) = (ctx.unbox(a), ctx.unbox(b));
+            (la == lb) as u64
+        }
+        BoxedOp::Hash => {
+            let la = ctx.unbox(a);
+            from_i(crate::hash_code(&la))
+        }
+        BoxedOp::Aref => {
+            let base = ctx.unbox(a);
+            let idx = as_i(b);
+            match &base {
+                LispVal::Array(arr) => {
+                    let v = arr.borrow();
+                    if idx < 0 || idx as usize >= v.len() {
+                        ctx.record_index_error(idx, v.len() as i64, false);
+                        return 0;
+                    }
+                    ctx.box_value(v[idx as usize].clone())
+                }
+                other => {
+                    ctx.record_boxed_not_array("FETCH", other);
+                    0
+                }
+            }
+        }
+        BoxedOp::Aset => {
+            let base = ctx.unbox(a);
+            let idx = as_i(b);
+            match &base {
+                LispVal::Array(arr) => {
+                    let len = arr.borrow().len();
+                    if idx < 0 || idx as usize >= len {
+                        ctx.record_index_error(idx, len as i64, true);
+                        return c;
+                    }
+                    let val = ctx.unbox(c);
+                    arr.borrow_mut()[idx as usize] = val;
+                    c
+                }
+                other => {
+                    ctx.record_boxed_not_array("STORE", other);
+                    c
+                }
+            }
+        }
+        BoxedOp::Len => {
+            let base = ctx.unbox(a);
+            match &base {
+                LispVal::Array(arr) => from_i(arr.borrow().len() as i64),
+                other => {
+                    ctx.record_boxed_not_array("ARRAY-LENGTH*", other);
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// Bounds-checked load of `field` of inline element `elem_idx` of an
+/// [`Ctx::alloc_buffer_stride`] buffer ([`Core::InlineFieldGet`]): the
+/// element-count header at word 0 still bounds `elem_idx` exactly like
+/// [`buf_get`]'s `idx`; out of range records the evaluator's index error and
+/// substitutes `0`.
+///
+/// # Safety: `base` must be a live buffer pointer from [`Ctx::alloc_buffer_stride`].
+#[inline]
+unsafe fn inline_field_get(
+    base: u64,
+    elem_idx: i64,
+    field: usize,
+    stride: usize,
+    ctx: &Ctx,
+) -> u64 {
+    let p = base as *const u64;
+    let len = unsafe { *p } as i64;
+    if elem_idx < 0 || elem_idx >= len {
+        ctx.record_index_error(elem_idx, len, false);
+        0
+    } else {
+        let word = 1 + elem_idx as usize * stride + field;
+        unsafe { *p.add(word) }
+    }
+}
+
+/// [`inline_field_get`]'s store counterpart ([`Core::InlineFieldSet`]).
+///
+/// # Safety: as [`inline_field_get`].
+#[inline]
+unsafe fn inline_field_set(
+    base: u64,
+    elem_idx: i64,
+    field: usize,
+    stride: usize,
+    val: u64,
+    ctx: &Ctx,
+) {
+    let p = base as *mut u64;
+    let len = unsafe { *p } as i64;
+    if elem_idx < 0 || elem_idx >= len {
+        ctx.record_index_error(elem_idx, len, true);
+    } else {
+        let word = 1 + elem_idx as usize * stride + field;
+        unsafe { *p.add(word) = val }
+    }
+}
+
+/// Bounds-checked, in-place initialization of every field of inline element
+/// `elem_idx` of an [`Ctx::alloc_buffer_stride`] buffer ([`Core::ArraySetStride`]):
+/// stores `vals[k]` at word `1 + elem_idx*stride + k` for each `k`.
+/// Out-of-range `elem_idx` records the evaluator's index error and is a
+/// no-op, matching [`buf_set`].
+///
+/// # Safety: `base` must be a live buffer pointer from [`Ctx::alloc_buffer_stride`].
+#[inline]
+unsafe fn array_set_stride(base: u64, elem_idx: i64, stride: usize, vals: &[u64], ctx: &Ctx) {
+    let p = base as *mut u64;
+    let len = unsafe { *p } as i64;
+    if elem_idx < 0 || elem_idx >= len {
+        ctx.record_index_error(elem_idx, len, true);
+    } else {
+        let base_word = 1 + elem_idx as usize * stride;
+        for (k, v) in vals.iter().enumerate() {
+            unsafe { *p.add(base_word + k) = *v };
+        }
+    }
+}
+
+/// Shared scalar reference implementation of [`Core::ArrayMap2`]: `out[i] =
+/// a[i] OP b[i]` for `i` in `0..min(len out, len a, len b)`. This is the
+/// interpreter-side parity reference the native SIMD lowering
+/// (`native.rs::emit_array_map2`) must agree with bit-for-bit — elementwise
+/// ops have no reduction/reassociation, so a plain scalar loop and a 2-lane
+/// vector loop (plus scalar tail) necessarily produce the same result
+/// per-index. Integer arithmetic is wrapping (no overflow flag: see
+/// [`Core::ArrayMap2`]'s doc comment for why).
+///
+/// # Safety
+/// `base_out`/`base_a`/`base_b` must each be a live buffer pointer from
+/// [`Ctx::alloc_buffer`]/[`Ctx::alloc_buffer_signed`].
+#[inline]
+unsafe fn array_map2(op: BinOp, kind: NumKind, base_out: u64, base_a: u64, base_b: u64) {
+    let pa = base_a as *const u64;
+    let pb = base_b as *const u64;
+    let po = base_out as *mut u64;
+    let len_a = unsafe { *pa } as i64;
+    let len_b = unsafe { *pb } as i64;
+    let len_o = unsafe { *po } as i64;
+    let min_len = len_a.min(len_b).min(len_o).max(0);
+    for i in 0..min_len as usize {
+        let x = unsafe { *pa.add(i + 1) };
+        let y = unsafe { *pb.add(i + 1) };
+        let r = match kind {
+            NumKind::I => {
+                let (xi, yi) = (as_i(x), as_i(y));
+                let ri = match op {
+                    BinOp::Add => xi.wrapping_add(yi),
+                    BinOp::Sub => xi.wrapping_sub(yi),
+                    BinOp::Mul => xi.wrapping_mul(yi),
+                    _ => unreachable!("ArrayMap2 only ever carries Add/Sub/Mul"),
+                };
+                from_i(ri)
+            }
+            NumKind::F => {
+                let (xf, yf) = (as_f(x), as_f(y));
+                let rf = match op {
+                    BinOp::Add => xf + yf,
+                    BinOp::Sub => xf - yf,
+                    BinOp::Mul => xf * yf,
+                    _ => unreachable!("ArrayMap2 only ever carries Add/Sub/Mul"),
+                };
+                from_f(rf)
+            }
+        };
+        unsafe { *po.add(i + 1) = r };
+    }
+}
+
+/// Shared scalar reference implementation of [`Core::ArrayOp`] (#394), the
+/// one the interpreting tiers call; the native backend emits the same
+/// per-element arithmetic as a SIMD loop (#525,
+/// `native.rs::Emitter::emit_array_op`). `w` holds
+/// the operand words, `out` first; array operands are buffer pointers and
+/// the `Scale` scalar is a raw int64/float64 word. Iterates `min(len)` of the
+/// array operands; each element depends only on its own index, so `out` may
+/// alias an input. Returns `out`.
+///
+/// # Safety
+/// Every array operand must be a live buffer pointer from
+/// [`Ctx::alloc_buffer`]/[`Ctx::alloc_buffer_signed`].
+pub(super) unsafe fn array_op(op: ArrOp, kind: NumKind, w: &[u64]) -> u64 {
+    let len = |p: u64| unsafe { *(p as *const u64) } as i64;
+    let mut n = i64::MAX;
+    for (i, &p) in w.iter().enumerate().take(op.arity()) {
+        if op.operand_is_array(i) {
+            n = n.min(len(p));
+        }
+    }
+    let n = n.max(0) as usize;
+    let at = |p: u64, i: usize| unsafe { *(p as *const u64).add(i + 1) };
+    let po = w[0] as *mut u64;
+    for i in 0..n {
+        let r = match (op, kind) {
+            (ArrOp::Div, NumKind::F) => from_f(as_f(at(w[1], i)) / as_f(at(w[2], i))),
+            (ArrOp::Div, NumKind::I) => unreachable!("array-div! is float64-only"),
+            (ArrOp::Scale, NumKind::I) => from_i(as_i(at(w[1], i)).wrapping_mul(as_i(w[2]))),
+            (ArrOp::Scale, NumKind::F) => from_f(as_f(at(w[1], i)) * as_f(w[2])),
+            (ArrOp::Fma, NumKind::I) => from_i(
+                as_i(at(w[1], i))
+                    .wrapping_mul(as_i(at(w[2], i)))
+                    .wrapping_add(as_i(at(w[3], i))),
+            ),
+            (ArrOp::Fma, NumKind::F) => {
+                from_f(as_f(at(w[1], i)).mul_add(as_f(at(w[2], i)), as_f(at(w[3], i))))
+            }
+            (ArrOp::Neg, NumKind::I) => from_i(as_i(at(w[1], i)).wrapping_neg()),
+            (ArrOp::Neg, NumKind::F) => from_f(-as_f(at(w[1], i))),
+        };
+        unsafe { *po.add(i + 1) = r };
+    }
+    w[0]
+}
+
+/// Shared scalar reference implementation of [`Core::ArraySum`], returning
+/// the result as raw word bits. int64: wrapping sum (associative, so any
+/// order is exact). float64: [`crate::f64_reduce_by`] — the language leaves
+/// the addition order unspecified (Fortran `SUM`); this is the shape the
+/// native backend's SIMD loop also computes (an implementation property).
+///
+/// # Safety
+/// `base_a` must be a live buffer pointer from
+/// [`Ctx::alloc_buffer`]/[`Ctx::alloc_buffer_signed`].
+#[inline]
+unsafe fn array_sum(kind: NumKind, base_a: u64) -> u64 {
+    let pa = base_a as *const u64;
+    let len_a = (unsafe { *pa } as i64).max(0) as usize;
+    match kind {
+        NumKind::I => {
+            let mut acc: i64 = 0;
+            for i in 0..len_a {
+                acc = acc.wrapping_add(as_i(unsafe { *pa.add(i + 1) }));
+            }
+            from_i(acc)
+        }
+        NumKind::F => from_f(crate::f64_reduce_by(len_a, |i| {
+            as_f(unsafe { *pa.add(i + 1) })
+        })),
+    }
+}
+
+/// Shared scalar reference implementation of [`Core::ArrayDot`]: sum over
+/// `i in 0..min(len a, len b)` of `a[i] * b[i]`, as raw word bits. int64
+/// wraps; float64 rounds each product then reduces via
+/// [`crate::f64_reduce_by`] (same contract as [`array_sum`]).
+///
+/// # Safety
+/// `base_a`/`base_b` must each be a live buffer pointer from
+/// [`Ctx::alloc_buffer`]/[`Ctx::alloc_buffer_signed`].
+#[inline]
+unsafe fn array_dot(kind: NumKind, base_a: u64, base_b: u64) -> u64 {
+    let pa = base_a as *const u64;
+    let pb = base_b as *const u64;
+    let len_a = unsafe { *pa } as i64;
+    let len_b = unsafe { *pb } as i64;
+    let min_len = len_a.min(len_b).max(0) as usize;
+    match kind {
+        NumKind::I => {
+            let mut acc: i64 = 0;
+            for i in 0..min_len {
+                let x = as_i(unsafe { *pa.add(i + 1) });
+                let y = as_i(unsafe { *pb.add(i + 1) });
+                acc = acc.wrapping_add(x.wrapping_mul(y));
+            }
+            from_i(acc)
+        }
+        NumKind::F => from_f(crate::f64_reduce_by(min_len, |i| {
+            as_f(unsafe { *pa.add(i + 1) }) * as_f(unsafe { *pb.add(i + 1) })
+        })),
+    }
+}
+
+/// Evaluate `core` in **tail position** of the function identified by
+/// `self_id`. A `Core::Call(id, ..)` reached here with `id == self_id` is a
+/// **self tail call** (issue #133 Tier 1): instead of recursing through
+/// [`Ctx::call`] (which would grow the native Rust stack once per
+/// iteration), the loop evaluates the new argument values, overwrites
+/// `env`'s parameter slots with them, and restarts from the top of the
+/// body — O(1) native stack for an arbitrarily deep tail-recursive typed
+/// function.
+///
+/// `self_id` exists so a *non-self* call, or a self call reached in a
+/// *non-tail* position (e.g. `fib`'s two recursive calls, or a self-call
+/// used as a `bin`/`cmp` operand or another call's argument), is never
+/// mistaken for a loop: only the tail-preserving constructs this loop
+/// switches on (`if`/`let`/`and`/`or`/`seq`) ever hand a `Call` node to this
+/// function with tail status still in effect; every definitely-non-tail
+/// sub-expression is evaluated via [`eval_core_nontail`], which always
+/// performs an ordinary (depth-bounded) call through the registry, even for
+/// a self-referencing id.
+pub(super) fn eval_core(
+    core: &Core,
+    env: &mut [u64],
+    ctx: &Ctx,
+    self_id: usize,
+    reclaim: bool,
+) -> u64 {
+    let top = core;
+    // Issue #212: arena length at entry. When `reclaim` (the caller proved
+    // the signature all-scalar), a self tail call frees everything rooted
+    // since — see `Ctx::arena_reclaim` for the contract.
+    let mark = ctx.arena_mark();
+    let mut current = core;
+    loop {
+        match current {
+            Core::If(c, t, e) => {
+                current = if eval_core_nontail(c, env, ctx) != 0 {
+                    t
+                } else {
+                    e
+                };
+            }
+            Core::Let(slot, init, body) => {
+                let v = eval_core_nontail(init, env, ctx);
+                env[*slot] = v;
+                current = body;
+            }
+            Core::And(a, b) => {
+                if eval_core_nontail(a, env, ctx) == 0 {
+                    return 0;
+                }
+                current = b;
+            }
+            Core::Or(a, b) => {
+                if eval_core_nontail(a, env, ctx) != 0 {
+                    return 1;
+                }
+                current = b;
+            }
+            Core::Seq(forms) => match forms.split_last() {
+                Some((last, init)) => {
+                    for f in init {
+                        eval_core_nontail(f, env, ctx);
+                    }
+                    current = last;
+                }
+                None => return 0,
+            },
+            Core::Call(id, args) if *id == self_id => {
+                // Parallel assignment: evaluate every new argument (which may
+                // read *old* slot values that a sibling argument is about to
+                // overwrite, e.g. `(sum (- n 1) (+ acc n))`) before storing
+                // any of them.
+                let vals: Vec<u64> = args
+                    .iter()
+                    .map(|a| eval_core_nontail(a, env, ctx))
+                    .collect();
+                env[..vals.len()].copy_from_slice(&vals);
+                if reclaim {
+                    ctx.arena_reclaim(mark);
+                }
+                if !ctx.charge_fuel() {
+                    return ctx.alloc_buffer(0) as u64;
+                }
+                current = top;
+            }
+            Core::Call(id, args) => {
+                // Tier 2a (issue #133): a *cross*-function tail call. Hand it
+                // off to the host trampoline (`Ctx::set_pending_tail`, drained
+                // by `TypedFn::invoke`) instead of recursing through
+                // `Ctx::call` — O(1) native Rust stack for arbitrarily deep
+                // mutual/general tail recursion (e.g. `even?`/`odd?`). The
+                // returned value is a placeholder; `invoke`'s trampoline loop
+                // overwrites it with the real result once the chain bottoms out.
+                let vals: Vec<u64> = args
+                    .iter()
+                    .map(|a| eval_core_nontail(a, env, ctx))
+                    .collect();
+                ctx.set_pending_tail(*id, &vals);
+                return 0;
+            }
+            other => return eval_core_nontail(other, env, ctx),
+        }
+    }
+}
+
+/// Evaluate `core` as a definitely-non-tail sub-expression: an ordinary,
+/// depth-bounded recursive walk. A `Call` here — even to `self_id` — is a
+/// real function call through the registry, never a tail loop.
+fn eval_core_nontail(core: &Core, env: &mut [u64], ctx: &Ctx) -> u64 {
+    match core {
+        Core::LitI(n) => from_i(*n),
+        Core::LitF(f) => from_f(*f),
+        Core::Var(i) => env[*i],
+        Core::Bin(k, op, a, b) => {
+            let (x, y) = (
+                eval_core_nontail(a, env, ctx),
+                eval_core_nontail(b, env, ctx),
+            );
+            match k {
+                NumKind::I => from_i(int_bin(*op, as_i(x), as_i(y), ctx)),
+                NumKind::F => from_f(float_bin(*op, as_f(x), as_f(y))),
+            }
+        }
+        Core::Cmp(k, op, a, b) => {
+            let (x, y) = (
+                eval_core_nontail(a, env, ctx),
+                eval_core_nontail(b, env, ctx),
+            );
+            let r = match k {
+                NumKind::I => int_cmp(*op, as_i(x), as_i(y)),
+                NumKind::F => float_cmp(*op, as_f(x), as_f(y)),
+            };
+            r as u64
+        }
+        Core::Not(a) => (eval_core_nontail(a, env, ctx) == 0) as u64,
+        Core::And(a, b) => {
+            if eval_core_nontail(a, env, ctx) != 0 {
+                (eval_core_nontail(b, env, ctx) != 0) as u64
+            } else {
+                0
+            }
+        }
+        Core::Or(a, b) => {
+            if eval_core_nontail(a, env, ctx) != 0 {
+                1
+            } else {
+                (eval_core_nontail(b, env, ctx) != 0) as u64
+            }
+        }
+        Core::If(c, t, e) => {
+            if eval_core_nontail(c, env, ctx) != 0 {
+                eval_core_nontail(t, env, ctx)
+            } else {
+                eval_core_nontail(e, env, ctx)
+            }
+        }
+        Core::Let(slot, init, body) => {
+            let v = eval_core_nontail(init, env, ctx);
+            env[*slot] = v;
+            eval_core_nontail(body, env, ctx)
+        }
+        Core::Call(id, args) => {
+            let vals: Vec<u64> = args
+                .iter()
+                .map(|a| eval_core_nontail(a, env, ctx))
+                .collect();
+            ctx.call(*id, &vals)
+        }
+        Core::ToChar(a) => ctx.to_char(as_i(eval_core_nontail(a, env, ctx))),
+        Core::FUnary(op, a) => op.apply_word(as_f(eval_core_nontail(a, env, ctx))),
+        Core::FBinary(op, a, b) => {
+            let x = eval_core_nontail(a, env, ctx);
+            op.apply_word(x, eval_core_nontail(b, env, ctx))
+        }
+        Core::IntToFloat(a) => from_f(as_i(eval_core_nontail(a, env, ctx)) as f64),
+        Core::ArrayNew(n) => {
+            let len = as_i(eval_core_nontail(n, env, ctx));
+            ctx.alloc_buffer_signed(len) as u64
+        }
+        Core::ArrayGet(a, i) => {
+            let base = eval_core_nontail(a, env, ctx);
+            let idx = as_i(eval_core_nontail(i, env, ctx));
+            unsafe { buf_get(base, idx, ctx) }
+        }
+        Core::ArraySet(a, i, v) => {
+            let base = eval_core_nontail(a, env, ctx);
+            let idx = as_i(eval_core_nontail(i, env, ctx));
+            let val = eval_core_nontail(v, env, ctx);
+            unsafe { buf_set(base, idx, val, ctx) };
+            val
+        }
+        Core::ArrayLen(a) => {
+            let base = eval_core_nontail(a, env, ctx);
+            unsafe { *(base as *const u64) }
+        }
+        Core::ArrayMap2(op, kind, out, a, b) => {
+            // Evaluate `out`/`a`/`b` left to right (matches the elaborator's
+            // argument order and the native backend's evaluation order).
+            let base_out = eval_core_nontail(out, env, ctx);
+            let base_a = eval_core_nontail(a, env, ctx);
+            let base_b = eval_core_nontail(b, env, ctx);
+            unsafe { array_map2(*op, *kind, base_out, base_a, base_b) };
+            base_out
+        }
+        Core::ArrayOp(op, kind, xs) => {
+            let w: Vec<u64> = xs.iter().map(|x| eval_core_nontail(x, env, ctx)).collect();
+            unsafe { array_op(*op, *kind, &w) }
+        }
+        Core::ArraySum(k, a) => {
+            let base_a = eval_core_nontail(a, env, ctx);
+            unsafe { array_sum(*k, base_a) }
+        }
+        Core::ArrayDot(k, a, b) => {
+            let base_a = eval_core_nontail(a, env, ctx);
+            let base_b = eval_core_nontail(b, env, ctx);
+            unsafe { array_dot(*k, base_a, base_b) }
+        }
+        Core::ArrayNewStride(n, stride) => {
+            let len = as_i(eval_core_nontail(n, env, ctx));
+            ctx.alloc_buffer_stride(len, *stride) as u64
+        }
+        Core::ArraySetStride(a, i, stride, fields) => {
+            let base = eval_core_nontail(a, env, ctx);
+            let idx = as_i(eval_core_nontail(i, env, ctx));
+            let vals: Vec<u64> = fields
+                .iter()
+                .map(|f| eval_core_nontail(f, env, ctx))
+                .collect();
+            unsafe { array_set_stride(base, idx, *stride, &vals, ctx) };
+            0
+        }
+        Core::InlineFieldGet(a, i, field, stride) => {
+            let base = eval_core_nontail(a, env, ctx);
+            let idx = as_i(eval_core_nontail(i, env, ctx));
+            unsafe { inline_field_get(base, idx, *field, *stride, ctx) }
+        }
+        Core::InlineFieldSet(a, i, field, stride, v) => {
+            let base = eval_core_nontail(a, env, ctx);
+            let idx = as_i(eval_core_nontail(i, env, ctx));
+            let val = eval_core_nontail(v, env, ctx);
+            unsafe { inline_field_set(base, idx, *field, *stride, val, ctx) };
+            val
+        }
+        Core::StructNew(inits) => {
+            let vals: Vec<u64> = inits
+                .iter()
+                .map(|c| eval_core_nontail(c, env, ctx))
+                .collect();
+            let base = ctx.alloc_buffer(vals.len());
+            for (i, v) in vals.iter().enumerate() {
+                unsafe { *base.add(i + 1) = *v };
+            }
+            base as u64
+        }
+        Core::FieldGet(s, idx) => {
+            let base = eval_core_nontail(s, env, ctx);
+            unsafe { field_get(base, *idx) }
+        }
+        Core::FieldSet(s, idx, v) => {
+            let base = eval_core_nontail(s, env, ctx);
+            let val = eval_core_nontail(v, env, ctx);
+            unsafe { field_set(base, *idx, val) };
+            val
+        }
+        Core::Seq(forms) => {
+            let mut r = 0;
+            for f in forms {
+                r = eval_core_nontail(f, env, ctx);
+            }
+            r
+        }
+        Core::Assign(slot, val) => {
+            let v = eval_core_nontail(val, env, ctx);
+            env[*slot] = v;
+            v
+        }
+        Core::While(test, body) => {
+            while eval_core_nontail(test, env, ctx) != 0 {
+                if !ctx.charge_fuel() {
+                    break;
+                }
+                eval_core_nontail(body, env, ctx);
+            }
+            0
+        }
+        Core::For {
+            slot,
+            start,
+            end,
+            step,
+            body,
+        } => {
+            // Evaluate the bounds once, up front — matches the tree-walker
+            // (`special_forms.rs::eval_for`): the loop variable is not yet
+            // bound while START/END/STEP are evaluated.
+            let s = as_i(eval_core_nontail(start, env, ctx));
+            let e = as_i(eval_core_nontail(end, env, ctx));
+            let st = as_i(eval_core_nontail(step, env, ctx));
+            if st == 0 {
+                // Matches the tree-walker's "for step must be non-zero" error.
+                ctx.set_pending_error("for step must be non-zero".to_string());
+                return 0;
+            }
+            let mut i = s;
+            loop {
+                // Inclusive bound; direction depends on the sign of step.
+                if (st > 0 && i > e) || (st < 0 && i < e) {
+                    break;
+                }
+                if !ctx.charge_fuel() {
+                    break;
+                }
+                env[*slot] = from_i(i);
+                eval_core_nontail(body, env, ctx);
+                // Guard against overflow so a runaway step can't panic or
+                // silently wrap into an infinite loop (no OVERFLOW flag).
+                match i.checked_add(st) {
+                    Some(n) => i = n,
+                    None => break,
+                }
+            }
+            0
+        }
+        Core::BoxedOp(op, args) => {
+            let vals: Vec<u64> = args
+                .iter()
+                .map(|a| eval_core_nontail(a, env, ctx))
+                .collect();
+            boxed_op(
+                *op,
+                vals.first().copied().unwrap_or(0),
+                vals.get(1).copied().unwrap_or(0),
+                vals.get(2).copied().unwrap_or(0),
+                ctx,
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debug trace: a stepping interpreter over the typed core.
+// ---------------------------------------------------------------------------
+
+/// One recorded step of the tracing interpreter ([`Jit::trace_call`]).
+///
+/// The trace is a pre-order-ish log of node *completions*: a node's step is
+/// pushed once its sub-evaluations are done and its result word is known. This
+/// is enough to drive a stepper/examiner and to assert structural correctness
+/// properties (determinism, result-word agreement, slot-bound safety) over the
+/// reference interpreter without touching the hot path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceStep {
+    /// Nesting depth of this node in the body's syntax tree (root = 0).
+    pub depth: usize,
+    /// A stable tag for the node kind (`"litI"`, `"bin"`, `"if"`, `"call"`, …).
+    pub op: &'static str,
+    /// The raw machine word this node evaluated to (interpret via the static type).
+    pub result: u64,
+    /// For `Var`/`Let` nodes, the slot index touched; `usize::MAX` otherwise.
+    pub slot: usize,
+    /// For `Call` nodes, the callee function id; `usize::MAX` otherwise.
+    pub callee: usize,
+}
+
+pub(super) const NO_SLOT: usize = usize::MAX;
+pub(super) const NO_CALLEE: usize = usize::MAX;
+
+/// Tracing twin of [`eval_core`]. Pushes a [`TraceStep`] for every node it
+/// actually evaluates (so short-circuited `and`/`or`/`if` branches leave no
+/// step, exactly mirroring the evaluation the interpreter performs). It must
+/// stay byte-for-byte semantically identical to [`eval_core`]; the two are
+/// differential-tested against each other in the suite.
+pub(super) fn eval_core_traced(
+    core: &Core,
+    env: &mut [u64],
+    ctx: &Ctx,
+    depth: usize,
+    log: &mut Vec<TraceStep>,
+) -> u64 {
+    macro_rules! step {
+        ($op:expr, $result:expr, $slot:expr, $callee:expr) => {{
+            let r = $result;
+            log.push(TraceStep {
+                depth,
+                op: $op,
+                result: r,
+                slot: $slot,
+                callee: $callee,
+            });
+            r
+        }};
+    }
+    match core {
+        Core::LitI(n) => step!("litI", from_i(*n), NO_SLOT, NO_CALLEE),
+        Core::LitF(f) => step!("litF", from_f(*f), NO_SLOT, NO_CALLEE),
+        Core::Var(i) => step!("var", env[*i], *i, NO_CALLEE),
+        Core::Bin(k, op, a, b) => {
+            let x = eval_core_traced(a, env, ctx, depth + 1, log);
+            let y = eval_core_traced(b, env, ctx, depth + 1, log);
+            let r = match k {
+                NumKind::I => from_i(int_bin(*op, as_i(x), as_i(y), ctx)),
+                NumKind::F => from_f(float_bin(*op, as_f(x), as_f(y))),
+            };
+            step!("bin", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::Cmp(k, op, a, b) => {
+            let x = eval_core_traced(a, env, ctx, depth + 1, log);
+            let y = eval_core_traced(b, env, ctx, depth + 1, log);
+            let r = match k {
+                NumKind::I => int_cmp(*op, as_i(x), as_i(y)),
+                NumKind::F => float_cmp(*op, as_f(x), as_f(y)),
+            } as u64;
+            step!("cmp", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::Not(a) => {
+            let v = eval_core_traced(a, env, ctx, depth + 1, log);
+            step!("not", (v == 0) as u64, NO_SLOT, NO_CALLEE)
+        }
+        Core::And(a, b) => {
+            let r = if eval_core_traced(a, env, ctx, depth + 1, log) != 0 {
+                (eval_core_traced(b, env, ctx, depth + 1, log) != 0) as u64
+            } else {
+                0
+            };
+            step!("and", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::Or(a, b) => {
+            let r = if eval_core_traced(a, env, ctx, depth + 1, log) != 0 {
+                1
+            } else {
+                (eval_core_traced(b, env, ctx, depth + 1, log) != 0) as u64
+            };
+            step!("or", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::If(c, t, e) => {
+            let r = if eval_core_traced(c, env, ctx, depth + 1, log) != 0 {
+                eval_core_traced(t, env, ctx, depth + 1, log)
+            } else {
+                eval_core_traced(e, env, ctx, depth + 1, log)
+            };
+            step!("if", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::Let(slot, init, body) => {
+            let v = eval_core_traced(init, env, ctx, depth + 1, log);
+            env[*slot] = v;
+            let r = eval_core_traced(body, env, ctx, depth + 1, log);
+            step!("let", r, *slot, NO_CALLEE)
+        }
+        Core::Call(id, args) => {
+            let vals: Vec<u64> = args
+                .iter()
+                .map(|a| eval_core_traced(a, env, ctx, depth + 1, log))
+                .collect();
+            step!("call", ctx.call(*id, &vals), NO_SLOT, *id)
+        }
+        Core::ToChar(a) => {
+            let v = eval_core_traced(a, env, ctx, depth + 1, log);
+            step!("tochar", ctx.to_char(as_i(v)), NO_SLOT, NO_CALLEE)
+        }
+        Core::FUnary(op, a) => {
+            let v = eval_core_traced(a, env, ctx, depth + 1, log);
+            step!("funary", op.apply_word(as_f(v)), NO_SLOT, NO_CALLEE)
+        }
+        Core::FBinary(op, a, b) => {
+            let x = eval_core_traced(a, env, ctx, depth + 1, log);
+            let y = eval_core_traced(b, env, ctx, depth + 1, log);
+            step!("fbinary", op.apply_word(x, y), NO_SLOT, NO_CALLEE)
+        }
+        Core::IntToFloat(a) => {
+            let v = eval_core_traced(a, env, ctx, depth + 1, log);
+            step!("i2f", from_f(as_i(v) as f64), NO_SLOT, NO_CALLEE)
+        }
+        Core::ArrayNew(n) => {
+            let len = as_i(eval_core_traced(n, env, ctx, depth + 1, log));
+            step!(
+                "arraynew",
+                ctx.alloc_buffer_signed(len) as u64,
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::ArrayGet(a, i) => {
+            let base = eval_core_traced(a, env, ctx, depth + 1, log);
+            let idx = as_i(eval_core_traced(i, env, ctx, depth + 1, log));
+            step!(
+                "arrayget",
+                unsafe { buf_get(base, idx, ctx) },
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::ArraySet(a, i, v) => {
+            let base = eval_core_traced(a, env, ctx, depth + 1, log);
+            let idx = as_i(eval_core_traced(i, env, ctx, depth + 1, log));
+            let val = eval_core_traced(v, env, ctx, depth + 1, log);
+            unsafe { buf_set(base, idx, val, ctx) };
+            step!("arrayset", val, NO_SLOT, NO_CALLEE)
+        }
+        Core::ArrayLen(a) => {
+            let base = eval_core_traced(a, env, ctx, depth + 1, log);
+            step!(
+                "arraylen",
+                unsafe { *(base as *const u64) },
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::ArrayMap2(op, kind, out, a, b) => {
+            let base_out = eval_core_traced(out, env, ctx, depth + 1, log);
+            let base_a = eval_core_traced(a, env, ctx, depth + 1, log);
+            let base_b = eval_core_traced(b, env, ctx, depth + 1, log);
+            unsafe { array_map2(*op, *kind, base_out, base_a, base_b) };
+            step!("arraymap2", base_out, NO_SLOT, NO_CALLEE)
+        }
+        Core::ArrayOp(op, kind, xs) => {
+            let w: Vec<u64> = xs
+                .iter()
+                .map(|x| eval_core_traced(x, env, ctx, depth + 1, log))
+                .collect();
+            let r = unsafe { array_op(*op, *kind, &w) };
+            step!("arrayop", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::ArraySum(k, a) => {
+            let base_a = eval_core_traced(a, env, ctx, depth + 1, log);
+            step!(
+                "arraysum",
+                unsafe { array_sum(*k, base_a) },
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::ArrayDot(k, a, b) => {
+            let base_a = eval_core_traced(a, env, ctx, depth + 1, log);
+            let base_b = eval_core_traced(b, env, ctx, depth + 1, log);
+            step!(
+                "arraydot",
+                unsafe { array_dot(*k, base_a, base_b) },
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::ArrayNewStride(n, stride) => {
+            let len = as_i(eval_core_traced(n, env, ctx, depth + 1, log));
+            step!(
+                "arraynewstride",
+                ctx.alloc_buffer_stride(len, *stride) as u64,
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::ArraySetStride(a, i, stride, fields) => {
+            let base = eval_core_traced(a, env, ctx, depth + 1, log);
+            let idx = as_i(eval_core_traced(i, env, ctx, depth + 1, log));
+            let vals: Vec<u64> = fields
+                .iter()
+                .map(|f| eval_core_traced(f, env, ctx, depth + 1, log))
+                .collect();
+            unsafe { array_set_stride(base, idx, *stride, &vals, ctx) };
+            step!("arraysetstride", 0, NO_SLOT, NO_CALLEE)
+        }
+        Core::InlineFieldGet(a, i, field, stride) => {
+            let base = eval_core_traced(a, env, ctx, depth + 1, log);
+            let idx = as_i(eval_core_traced(i, env, ctx, depth + 1, log));
+            step!(
+                "inlinefieldget",
+                unsafe { inline_field_get(base, idx, *field, *stride, ctx) },
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::InlineFieldSet(a, i, field, stride, v) => {
+            let base = eval_core_traced(a, env, ctx, depth + 1, log);
+            let idx = as_i(eval_core_traced(i, env, ctx, depth + 1, log));
+            let val = eval_core_traced(v, env, ctx, depth + 1, log);
+            unsafe { inline_field_set(base, idx, *field, *stride, val, ctx) };
+            step!("inlinefieldset", val, NO_SLOT, NO_CALLEE)
+        }
+        Core::StructNew(inits) => {
+            let vals: Vec<u64> = inits
+                .iter()
+                .map(|c| eval_core_traced(c, env, ctx, depth + 1, log))
+                .collect();
+            let base = ctx.alloc_buffer(vals.len());
+            for (i, v) in vals.iter().enumerate() {
+                unsafe { *base.add(i + 1) = *v };
+            }
+            step!("structnew", base as u64, NO_SLOT, NO_CALLEE)
+        }
+        Core::FieldGet(s, idx) => {
+            let base = eval_core_traced(s, env, ctx, depth + 1, log);
+            step!(
+                "fieldget",
+                unsafe { field_get(base, *idx) },
+                NO_SLOT,
+                NO_CALLEE
+            )
+        }
+        Core::FieldSet(s, idx, v) => {
+            let base = eval_core_traced(s, env, ctx, depth + 1, log);
+            let val = eval_core_traced(v, env, ctx, depth + 1, log);
+            unsafe { field_set(base, *idx, val) };
+            step!("fieldset", val, NO_SLOT, NO_CALLEE)
+        }
+        Core::Seq(forms) => {
+            let mut r = 0;
+            for f in forms {
+                r = eval_core_traced(f, env, ctx, depth + 1, log);
+            }
+            step!("seq", r, NO_SLOT, NO_CALLEE)
+        }
+        Core::Assign(slot, val) => {
+            let v = eval_core_traced(val, env, ctx, depth + 1, log);
+            env[*slot] = v;
+            step!("assign", v, *slot, NO_CALLEE)
+        }
+        Core::While(test, body) => {
+            while eval_core_traced(test, env, ctx, depth + 1, log) != 0 {
+                eval_core_traced(body, env, ctx, depth + 1, log);
+            }
+            step!("while", 0, NO_SLOT, NO_CALLEE)
+        }
+        Core::For {
+            slot,
+            start,
+            end,
+            step: step_expr,
+            body,
+        } => {
+            let s = as_i(eval_core_traced(start, env, ctx, depth + 1, log));
+            let e = as_i(eval_core_traced(end, env, ctx, depth + 1, log));
+            let st = as_i(eval_core_traced(step_expr, env, ctx, depth + 1, log));
+            if st == 0 {
+                ctx.set_pending_error("for step must be non-zero".to_string());
+            } else {
+                let mut i = s;
+                loop {
+                    if (st > 0 && i > e) || (st < 0 && i < e) {
+                        break;
+                    }
+                    env[*slot] = from_i(i);
+                    eval_core_traced(body, env, ctx, depth + 1, log);
+                    match i.checked_add(st) {
+                        Some(n) => i = n,
+                        None => break,
+                    }
+                }
+            }
+            step!("for", 0, *slot, NO_CALLEE)
+        }
+        Core::BoxedOp(op, args) => {
+            let vals: Vec<u64> = args
+                .iter()
+                .map(|a| eval_core_traced(a, env, ctx, depth + 1, log))
+                .collect();
+            let r = boxed_op(
+                *op,
+                vals.first().copied().unwrap_or(0),
+                vals.get(1).copied().unwrap_or(0),
+                vals.get(2).copied().unwrap_or(0),
+                ctx,
+            );
+            step!("boxedop", r, NO_SLOT, NO_CALLEE)
+        }
+    }
+}
+
+/// Number of nodes in a typed-core tree (structural size, for invariants).
+pub fn core_node_count(core: &Core) -> usize {
+    1 + match core {
+        Core::LitI(_) | Core::LitF(_) | Core::Var(_) => 0,
+        Core::Not(a) | Core::ToChar(a) | Core::FUnary(_, a) | Core::IntToFloat(a) => {
+            core_node_count(a)
+        }
+        Core::Bin(_, _, a, b)
+        | Core::FBinary(_, a, b)
+        | Core::Cmp(_, _, a, b)
+        | Core::And(a, b)
+        | Core::Or(a, b)
+        | Core::Let(_, a, b) => core_node_count(a) + core_node_count(b),
+        Core::If(c, t, e) => core_node_count(c) + core_node_count(t) + core_node_count(e),
+        Core::Call(_, args) | Core::StructNew(args) | Core::Seq(args) => {
+            args.iter().map(core_node_count).sum()
+        }
+        Core::ArrayNew(a) | Core::ArrayLen(a) | Core::FieldGet(a, _) | Core::ArraySum(_, a) => {
+            core_node_count(a)
+        }
+        Core::ArrayGet(a, b) | Core::FieldSet(a, _, b) | Core::ArrayDot(_, a, b) => {
+            core_node_count(a) + core_node_count(b)
+        }
+        Core::ArraySet(a, b, c) | Core::ArrayMap2(_, _, a, b, c) => {
+            core_node_count(a) + core_node_count(b) + core_node_count(c)
+        }
+        Core::Assign(_, v) => core_node_count(v),
+        Core::While(t, b) => core_node_count(t) + core_node_count(b),
+        Core::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            core_node_count(start)
+                + core_node_count(end)
+                + core_node_count(step)
+                + core_node_count(body)
+        }
+        Core::ArrayNewStride(n, _) => core_node_count(n),
+        Core::InlineFieldGet(a, i, _, _) => core_node_count(a) + core_node_count(i),
+        Core::InlineFieldSet(a, i, _, _, v) => {
+            core_node_count(a) + core_node_count(i) + core_node_count(v)
+        }
+        Core::ArraySetStride(a, i, _, fields) => {
+            core_node_count(a)
+                + core_node_count(i)
+                + fields.iter().map(core_node_count).sum::<usize>()
+        }
+        Core::BoxedOp(_, args) | Core::ArrayOp(_, _, args) => {
+            args.iter().map(core_node_count).sum()
+        }
+    }
+}
+
+/// Verify a typed-core tree is *well-formed* against a frame of `n_slots`:
+/// every `Var`/`Let` slot index is in bounds, and every `Call` id is in
+/// `0..n_funcs`. This is a cheap subject-reduction-style structural check the
+/// suite runs on every defined function to catch lowering bugs that would
+/// otherwise corrupt memory or panic only on a lucky input.
+///
+/// Issue #476 (boxed handles), phase 3a: the "no `Core::Cmp` may ever be
+/// elaborated at boxed type" invariant — two distinct handles can alias the
+/// same underlying object, so comparing handle words would silently be
+/// wrong — has no separate check to add *here*. `Core::Cmp`/`Core::Bin`
+/// carry a [`NumKind`], not a [`Ty`](super::types::Ty), and `NumKind` is
+/// exhaustively `{I, F}`; there is no `NumKind::Boxed` and no way to
+/// construct one, so a boxed operand cannot reach a `Cmp`/`Bin` node in the
+/// first place — the type system enforces it at construction, one layer up
+/// in `elaboration.rs` (`Cx::reject_boxed_arith_cmp`), which is also the
+/// only place `Ty` information still exists (this function's `Core` carries
+/// none). Verified in `tests.rs`: `elaboration_rejects_*_on_boxed_operands`
+/// exercise the elaborator's refusal directly, and `num_kind_has_no_boxed_variant`
+/// pins the `NumKind` shape this comment relies on — if a future change ever
+/// added a boxed-flavored `NumKind`, that match stops being exhaustive and
+/// fails to *compile*, catching the regression before it could reach this
+/// function at all.
+pub fn verify_core(core: &Core, n_slots: usize, n_funcs: usize) -> Result<(), String> {
+    match core {
+        Core::LitI(_) | Core::LitF(_) => Ok(()),
+        Core::Var(i) => {
+            if *i < n_slots {
+                Ok(())
+            } else {
+                Err(format!("Var slot {i} out of bounds (n_slots={n_slots})"))
+            }
+        }
+        Core::Not(a) | Core::ToChar(a) | Core::FUnary(_, a) | Core::IntToFloat(a) => {
+            verify_core(a, n_slots, n_funcs)
+        }
+        Core::Bin(_, _, a, b)
+        | Core::FBinary(_, a, b)
+        | Core::Cmp(_, _, a, b)
+        | Core::And(a, b)
+        | Core::Or(a, b) => {
+            verify_core(a, n_slots, n_funcs)?;
+            verify_core(b, n_slots, n_funcs)
+        }
+        Core::Let(slot, init, body) => {
+            if *slot >= n_slots {
+                return Err(format!("Let slot {slot} out of bounds (n_slots={n_slots})"));
+            }
+            verify_core(init, n_slots, n_funcs)?;
+            verify_core(body, n_slots, n_funcs)
+        }
+        Core::If(c, t, e) => {
+            verify_core(c, n_slots, n_funcs)?;
+            verify_core(t, n_slots, n_funcs)?;
+            verify_core(e, n_slots, n_funcs)
+        }
+        Core::Call(id, args) => {
+            if *id >= n_funcs {
+                return Err(format!("Call id {id} out of bounds (n_funcs={n_funcs})"));
+            }
+            for a in args {
+                verify_core(a, n_slots, n_funcs)?;
+            }
+            Ok(())
+        }
+        Core::ArrayNew(a) | Core::ArrayLen(a) | Core::FieldGet(a, _) | Core::ArraySum(_, a) => {
+            verify_core(a, n_slots, n_funcs)
+        }
+        Core::ArrayGet(a, b) | Core::FieldSet(a, _, b) | Core::ArrayDot(_, a, b) => {
+            verify_core(a, n_slots, n_funcs)?;
+            verify_core(b, n_slots, n_funcs)
+        }
+        Core::ArraySet(a, b, c) | Core::ArrayMap2(_, _, a, b, c) => {
+            verify_core(a, n_slots, n_funcs)?;
+            verify_core(b, n_slots, n_funcs)?;
+            verify_core(c, n_slots, n_funcs)
+        }
+        Core::StructNew(inits) => {
+            for c in inits {
+                verify_core(c, n_slots, n_funcs)?;
+            }
+            Ok(())
+        }
+        Core::Seq(forms) => {
+            for c in forms {
+                verify_core(c, n_slots, n_funcs)?;
+            }
+            Ok(())
+        }
+        Core::Assign(slot, v) => {
+            if *slot >= n_slots {
+                return Err(format!(
+                    "Assign slot {slot} out of bounds (n_slots={n_slots})"
+                ));
+            }
+            verify_core(v, n_slots, n_funcs)
+        }
+        Core::While(t, b) => {
+            verify_core(t, n_slots, n_funcs)?;
+            verify_core(b, n_slots, n_funcs)
+        }
+        Core::For {
+            slot,
+            start,
+            end,
+            step,
+            body,
+        } => {
+            if *slot >= n_slots {
+                return Err(format!("For slot {slot} out of bounds (n_slots={n_slots})"));
+            }
+            verify_core(start, n_slots, n_funcs)?;
+            verify_core(end, n_slots, n_funcs)?;
+            verify_core(step, n_slots, n_funcs)?;
+            verify_core(body, n_slots, n_funcs)
+        }
+        Core::ArrayNewStride(n, _) => verify_core(n, n_slots, n_funcs),
+        Core::InlineFieldGet(a, i, _, _) => {
+            verify_core(a, n_slots, n_funcs)?;
+            verify_core(i, n_slots, n_funcs)
+        }
+        Core::InlineFieldSet(a, i, _, _, v) => {
+            verify_core(a, n_slots, n_funcs)?;
+            verify_core(i, n_slots, n_funcs)?;
+            verify_core(v, n_slots, n_funcs)
+        }
+        Core::ArraySetStride(a, i, _, fields) => {
+            verify_core(a, n_slots, n_funcs)?;
+            verify_core(i, n_slots, n_funcs)?;
+            for f in fields {
+                verify_core(f, n_slots, n_funcs)?;
+            }
+            Ok(())
+        }
+        Core::BoxedOp(_, args) | Core::ArrayOp(_, _, args) => {
+            for a in args {
+                verify_core(a, n_slots, n_funcs)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A compiled edition: a closure over an unboxed slot vector and a call context.
+pub type Compiled = Rc<dyn Fn(&mut [u64], &Ctx) -> u64>;
+
+/// Lower typed core to a tree of closures. Each node captures its compiled
+/// children, so the per-node `match` the interpreter pays is gone at call time.
+pub fn compile(core: &Core) -> Compiled {
+    match core {
+        Core::LitI(n) => {
+            let w = from_i(*n);
+            Rc::new(move |_e, _c| w)
+        }
+        Core::LitF(f) => {
+            let w = from_f(*f);
+            Rc::new(move |_e, _c| w)
+        }
+        Core::Var(i) => {
+            let i = *i;
+            Rc::new(move |e, _c| e[i])
+        }
+        Core::Bin(k, op, a, b) => {
+            let (ca, cb, op) = (compile(a), compile(b), *op);
+            match k {
+                NumKind::I => {
+                    Rc::new(move |e, c| from_i(int_bin(op, as_i(ca(e, c)), as_i(cb(e, c)), c)))
+                }
+                NumKind::F => {
+                    Rc::new(move |e, c| from_f(float_bin(op, as_f(ca(e, c)), as_f(cb(e, c)))))
+                }
+            }
+        }
+        Core::Cmp(k, op, a, b) => {
+            let (ca, cb, op) = (compile(a), compile(b), *op);
+            match k {
+                NumKind::I => {
+                    Rc::new(move |e, c| (int_cmp(op, as_i(ca(e, c)), as_i(cb(e, c)))) as u64)
+                }
+                NumKind::F => {
+                    Rc::new(move |e, c| (float_cmp(op, as_f(ca(e, c)), as_f(cb(e, c)))) as u64)
+                }
+            }
+        }
+        Core::Not(a) => {
+            let ca = compile(a);
+            Rc::new(move |e, c| (ca(e, c) == 0) as u64)
+        }
+        Core::And(a, b) => {
+            let (ca, cb) = (compile(a), compile(b));
+            Rc::new(move |e, c| {
+                if ca(e, c) != 0 {
+                    (cb(e, c) != 0) as u64
+                } else {
+                    0
+                }
+            })
+        }
+        Core::Or(a, b) => {
+            let (ca, cb) = (compile(a), compile(b));
+            Rc::new(move |e, c| {
+                if ca(e, c) != 0 {
+                    1
+                } else {
+                    (cb(e, c) != 0) as u64
+                }
+            })
+        }
+        Core::If(cnd, t, e) => {
+            let (cc, ct, ce) = (compile(cnd), compile(t), compile(e));
+            Rc::new(move |env, c| {
+                if cc(env, c) != 0 {
+                    ct(env, c)
+                } else {
+                    ce(env, c)
+                }
+            })
+        }
+        Core::Let(slot, init, body) => {
+            let (slot, ci, cb) = (*slot, compile(init), compile(body));
+            Rc::new(move |e, c| {
+                let v = ci(e, c);
+                e[slot] = v;
+                cb(e, c)
+            })
+        }
+        Core::Call(id, args) => {
+            let (id, cargs): (usize, Vec<Compiled>) = (*id, args.iter().map(compile).collect());
+            Rc::new(move |e, c| {
+                let mut vals = Vec::with_capacity(cargs.len());
+                for ca in &cargs {
+                    vals.push(ca(e, c));
+                }
+                c.call(id, &vals)
+            })
+        }
+        Core::ToChar(a) => {
+            let ca = compile(a);
+            Rc::new(move |e, c| c.to_char(as_i(ca(e, c))))
+        }
+        Core::FUnary(op, a) => {
+            let op = *op;
+            let ca = compile(a);
+            Rc::new(move |e, c| op.apply_word(as_f(ca(e, c))))
+        }
+        Core::FBinary(op, a, b) => {
+            let op = *op;
+            let ca = compile(a);
+            let cb = compile(b);
+            Rc::new(move |e, c| {
+                let x = ca(e, c);
+                op.apply_word(x, cb(e, c))
+            })
+        }
+        Core::IntToFloat(a) => {
+            let ca = compile(a);
+            Rc::new(move |e, c| from_f(as_i(ca(e, c)) as f64))
+        }
+        Core::ArrayNew(n) => {
+            let cn = compile(n);
+            Rc::new(move |e, c| {
+                let len = as_i(cn(e, c));
+                c.alloc_buffer_signed(len) as u64
+            })
+        }
+        Core::ArrayGet(a, i) => {
+            let (ca, ci) = (compile(a), compile(i));
+            Rc::new(move |e, c| {
+                let base = ca(e, c);
+                let idx = as_i(ci(e, c));
+                unsafe { buf_get(base, idx, c) }
+            })
+        }
+        Core::ArraySet(a, i, v) => {
+            let (ca, ci, cv) = (compile(a), compile(i), compile(v));
+            Rc::new(move |e, c| {
+                let base = ca(e, c);
+                let idx = as_i(ci(e, c));
+                let val = cv(e, c);
+                unsafe { buf_set(base, idx, val, c) };
+                val
+            })
+        }
+        Core::ArrayLen(a) => {
+            let ca = compile(a);
+            Rc::new(move |e, c| {
+                let base = ca(e, c);
+                unsafe { *(base as *const u64) }
+            })
+        }
+        Core::ArrayMap2(op, kind, out, a, b) => {
+            let (op, kind) = (*op, *kind);
+            let (co, ca, cb) = (compile(out), compile(a), compile(b));
+            Rc::new(move |e, c| {
+                let base_out = co(e, c);
+                let base_a = ca(e, c);
+                let base_b = cb(e, c);
+                unsafe { array_map2(op, kind, base_out, base_a, base_b) };
+                base_out
+            })
+        }
+        Core::ArrayOp(op, kind, xs) => {
+            let (op, kind) = (*op, *kind);
+            let cs: Vec<_> = xs.iter().map(&compile).collect();
+            Rc::new(move |e, c| {
+                let w: Vec<u64> = cs.iter().map(|cx| cx(e, c)).collect();
+                unsafe { array_op(op, kind, &w) }
+            })
+        }
+        Core::ArraySum(k, a) => {
+            let (k, ca) = (*k, compile(a));
+            Rc::new(move |e, c| {
+                let base_a = ca(e, c);
+                unsafe { array_sum(k, base_a) }
+            })
+        }
+        Core::ArrayDot(k, a, b) => {
+            let (k, ca, cb) = (*k, compile(a), compile(b));
+            Rc::new(move |e, c| {
+                let base_a = ca(e, c);
+                let base_b = cb(e, c);
+                unsafe { array_dot(k, base_a, base_b) }
+            })
+        }
+        Core::ArrayNewStride(n, stride) => {
+            let (cn, stride) = (compile(n), *stride);
+            Rc::new(move |e, c| {
+                let len = as_i(cn(e, c));
+                c.alloc_buffer_stride(len, stride) as u64
+            })
+        }
+        Core::ArraySetStride(a, i, stride, fields) => {
+            let (ca, ci, stride) = (compile(a), compile(i), *stride);
+            let cfields: Vec<Compiled> = fields.iter().map(compile).collect();
+            Rc::new(move |e, c| {
+                let base = ca(e, c);
+                let idx = as_i(ci(e, c));
+                let vals: Vec<u64> = cfields.iter().map(|cf| cf(e, c)).collect();
+                unsafe { array_set_stride(base, idx, stride, &vals, c) };
+                0
+            })
+        }
+        Core::InlineFieldGet(a, i, field, stride) => {
+            let (ca, ci, field, stride) = (compile(a), compile(i), *field, *stride);
+            Rc::new(move |e, c| {
+                let base = ca(e, c);
+                let idx = as_i(ci(e, c));
+                unsafe { inline_field_get(base, idx, field, stride, c) }
+            })
+        }
+        Core::InlineFieldSet(a, i, field, stride, v) => {
+            let (ca, ci, field, stride, cv) = (compile(a), compile(i), *field, *stride, compile(v));
+            Rc::new(move |e, c| {
+                let base = ca(e, c);
+                let idx = as_i(ci(e, c));
+                let val = cv(e, c);
+                unsafe { inline_field_set(base, idx, field, stride, val, c) };
+                val
+            })
+        }
+        Core::StructNew(inits) => {
+            let cinits: Vec<Compiled> = inits.iter().map(compile).collect();
+            Rc::new(move |e, c| {
+                let base = c.alloc_buffer(cinits.len());
+                for (i, ci) in cinits.iter().enumerate() {
+                    let v = ci(e, c);
+                    unsafe { *base.add(i + 1) = v };
+                }
+                base as u64
+            })
+        }
+        Core::FieldGet(s, idx) => {
+            let (cs, idx) = (compile(s), *idx);
+            Rc::new(move |e, c| {
+                let base = cs(e, c);
+                unsafe { field_get(base, idx) }
+            })
+        }
+        Core::FieldSet(s, idx, v) => {
+            let (cs, idx, cv) = (compile(s), *idx, compile(v));
+            Rc::new(move |e, c| {
+                let base = cs(e, c);
+                let val = cv(e, c);
+                unsafe { field_set(base, idx, val) };
+                val
+            })
+        }
+        Core::Seq(forms) => {
+            let cforms: Vec<Compiled> = forms.iter().map(compile).collect();
+            Rc::new(move |e, c| {
+                let mut r = 0;
+                for cf in &cforms {
+                    r = cf(e, c);
+                }
+                r
+            })
+        }
+        Core::Assign(slot, val) => {
+            let (slot, cv) = (*slot, compile(val));
+            Rc::new(move |e, c| {
+                let v = cv(e, c);
+                e[slot] = v;
+                v
+            })
+        }
+        Core::While(test, body) => {
+            let (ct, cb) = (compile(test), compile(body));
+            Rc::new(move |e, c| {
+                while ct(e, c) != 0 {
+                    cb(e, c);
+                }
+                0
+            })
+        }
+        Core::For {
+            slot,
+            start,
+            end,
+            step,
+            body,
+        } => {
+            let slot = *slot;
+            let (cs, ce, cstep, cbody) =
+                (compile(start), compile(end), compile(step), compile(body));
+            Rc::new(move |e, c| {
+                let s = as_i(cs(e, c));
+                let end = as_i(ce(e, c));
+                let st = as_i(cstep(e, c));
+                if st == 0 {
+                    c.set_pending_error("for step must be non-zero".to_string());
+                    return 0;
+                }
+                let mut i = s;
+                loop {
+                    if (st > 0 && i > end) || (st < 0 && i < end) {
+                        break;
+                    }
+                    e[slot] = from_i(i);
+                    cbody(e, c);
+                    match i.checked_add(st) {
+                        Some(n) => i = n,
+                        None => break,
+                    }
+                }
+                0
+            })
+        }
+        Core::BoxedOp(op, args) => {
+            let op = *op;
+            let cargs: Vec<Compiled> = args.iter().map(compile).collect();
+            Rc::new(move |e, c| {
+                let vals: Vec<u64> = cargs.iter().map(|ca| ca(e, c)).collect();
+                boxed_op(
+                    op,
+                    vals.first().copied().unwrap_or(0),
+                    vals.get(1).copied().unwrap_or(0),
+                    vals.get(2).copied().unwrap_or(0),
+                    c,
+                )
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Closure-backend tail-call optimization (issue #133 Tier 1).
+// ---------------------------------------------------------------------------
+
+/// Outcome of one step of a tail-position compiled closure: either the final
+/// value, or a signal that a self tail call just overwrote `env`'s parameter
+/// slots and the top-level loop in [`compile_with_tco`] should run the body
+/// again.
+pub(super) enum TailStep {
+    Done(u64),
+    Loop,
+}
+
+/// A tail-position compiled closure — the closure-backend counterpart of
+/// [`eval_core`]'s tail loop.
+pub(super) type CompiledTail = Rc<dyn Fn(&mut [u64], &Ctx) -> TailStep>;
+
+/// Compile `core`, the body of the function identified by `self_id`, to a
+/// [`Compiled`] closure with tail-call optimization: a `Core::Call(id, ..)`
+/// reached in tail position with `id == self_id` loops in place instead of
+/// recursing through [`Ctx::call`] — O(1) native (Rust) stack for an
+/// arbitrarily deep tail-recursive typed function, mirroring [`eval_core`]'s
+/// discipline for the closure backend that `TypedFn::compile_now` actually
+/// installs as the default-build hot path.
+///
+/// `reclaim` (issue #212) frees the iteration's arena buffers on each loop
+/// edge; the caller may pass `true` only for an all-scalar signature (see
+/// [`Ctx::arena_reclaim`]).
+pub fn compile_with_tco(core: &Core, self_id: usize, reclaim: bool) -> Compiled {
+    let tail = compile_tail(core, self_id);
+    Rc::new(move |env, ctx| {
+        let mark = ctx.arena_mark();
+        loop {
+            match tail(env, ctx) {
+                TailStep::Done(v) => return v,
+                TailStep::Loop => {
+                    if reclaim {
+                        ctx.arena_reclaim(mark);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Compile `core` as a tail-position node of the function `self_id`. Tail
+/// status only propagates through the constructs whose value is *exactly*
+/// their tail sub-node's value with no further transformation
+/// (`if`/`let`/`and`/`or`/`seq`); everything else compiles via the ordinary
+/// (non-tail) [`compile`] and is wrapped as an already-`Done` step.
+fn compile_tail(core: &Core, self_id: usize) -> CompiledTail {
+    match core {
+        Core::If(c, t, e) => {
+            let cc = compile(c);
+            let ct = compile_tail(t, self_id);
+            let ce = compile_tail(e, self_id);
+            Rc::new(move |env, ctx| {
+                if cc(env, ctx) != 0 {
+                    ct(env, ctx)
+                } else {
+                    ce(env, ctx)
+                }
+            })
+        }
+        Core::Let(slot, init, body) => {
+            let slot = *slot;
+            let ci = compile(init);
+            let cb = compile_tail(body, self_id);
+            Rc::new(move |env, ctx| {
+                let v = ci(env, ctx);
+                env[slot] = v;
+                cb(env, ctx)
+            })
+        }
+        Core::And(a, b) => {
+            let ca = compile(a);
+            let cb = compile_tail(b, self_id);
+            Rc::new(move |env, ctx| {
+                if ca(env, ctx) != 0 {
+                    cb(env, ctx)
+                } else {
+                    TailStep::Done(0)
+                }
+            })
+        }
+        Core::Or(a, b) => {
+            let ca = compile(a);
+            let cb = compile_tail(b, self_id);
+            Rc::new(move |env, ctx| {
+                if ca(env, ctx) != 0 {
+                    TailStep::Done(1)
+                } else {
+                    cb(env, ctx)
+                }
+            })
+        }
+        Core::Seq(forms) => match forms.split_last() {
+            Some((last, init)) => {
+                let cinit: Vec<Compiled> = init.iter().map(compile).collect();
+                let clast = compile_tail(last, self_id);
+                Rc::new(move |env, ctx| {
+                    for f in &cinit {
+                        f(env, ctx);
+                    }
+                    clast(env, ctx)
+                })
+            }
+            None => Rc::new(|_e, _c| TailStep::Done(0)),
+        },
+        Core::Call(id, args) if *id == self_id => {
+            let cargs: Vec<Compiled> = args.iter().map(compile).collect();
+            Rc::new(move |env, ctx| {
+                // Parallel assignment: see eval_core's identical comment.
+                let vals: Vec<u64> = cargs.iter().map(|ca| ca(env, ctx)).collect();
+                env[..vals.len()].copy_from_slice(&vals);
+                TailStep::Loop
+            })
+        }
+        Core::Call(id, args) => {
+            // Tier 2a (issue #133): cross-function tail call -> host
+            // trampoline. See eval_core's identical arm for the rationale;
+            // `TailStep::Done`'s value is a placeholder that `invoke`'s
+            // trampoline loop overwrites once the chain bottoms out.
+            let id = *id;
+            let cargs: Vec<Compiled> = args.iter().map(compile).collect();
+            Rc::new(move |env, ctx| {
+                let vals: Vec<u64> = cargs.iter().map(|ca| ca(env, ctx)).collect();
+                ctx.set_pending_tail(id, &vals);
+                TailStep::Done(0)
+            })
+        }
+        other => {
+            let cv = compile(other);
+            Rc::new(move |env, ctx| TailStep::Done(cv(env, ctx)))
+        }
+    }
+}

@@ -1,0 +1,1872 @@
+// ---------------------------------------------------------------------------
+// Types and runtime values.
+// ---------------------------------------------------------------------------
+
+use super::*;
+
+/// A monomorphic type in the typed core.
+///
+/// No longer `Copy`: arrays (#137/#138) and structs carry owned component types,
+/// so the type is a small recursive tree. It is cheap to `clone` (scalars are
+/// nullary; only compounds allocate).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Ty {
+    Int64,
+    Float64,
+    Bool,
+    /// A byte / `u8` scalar (issue #136). Runtime representation is the byte
+    /// value (`0..=255`) held in the low bits of the `u64` word; it slots into
+    /// the unboxed scalar tier alongside `int64`/`float64`/`bool`.
+    Char,
+    /// A flat array of a scalar element type (#137/#138). The runtime value is a
+    /// pointer to a header-prefixed `u64` buffer `[len, e0, e1, …]` rooted in the
+    /// call arena (`Ctx`); every element is one `u64` word read per the element
+    /// type. `(array char)` *is* a string (native byte processing, #137).
+    /// The element type cannot be written in surface syntax — it is **inferred**
+    /// (the reason #135 came first) — though a param/return may pin it
+    /// (`(array int64)`), or leave it open with the bare `array` keyword.
+    Array(Box<Ty>),
+    /// A struct: a fixed record of named scalar fields, laid out as a flat
+    /// `u64` buffer (one word per field) rooted in the call arena, like a
+    /// fixed-shape array with named offsets.
+    Struct(Rc<StructDef>),
+    /// A declared sum type (#312 follow-up): the checker-level union of a
+    /// closed set of constructor brands. Never compiled; checker-only.
+    Variant(Rc<VariantDef>),
+    /// An APPLIED parametric nominal (0.3 HM generics): `(option int64)`,
+    /// `(pair a b)`. Nominal by definition name; arguments unify pairwise;
+    /// a constructor application absorbs into its variant's application.
+    /// Never compiled; checker-only.
+    App(Rc<GenericDef>, Vec<Ty>),
+    /// A type variable (issue #135): an as-yet-undetermined type, identified by
+    /// a fresh id. Variables exist only *during* elaboration; `Infer::resolve`
+    /// must drive every one to a concrete type before a definition is accepted,
+    /// so no `Var` is ever stored in a function signature or reaches the runtime
+    /// membrane.
+    Var(u32),
+
+    // --- checkable-but-not-compileable types (issue #162) ------------------
+    // These extend the *checker's* type language past the compileable lattice:
+    // the inference engine can prove a value has one of these types (catching
+    // software type errors), even though codegen does not lower them to unboxed
+    // native code. `is_compileable` partitions the lattice; the codegen gate
+    // (`resolve_compileable`) rejects everything below this line.
+    /// A homogeneous proper list of `T` (boxed `LispVal` cons chain).
+    List(Box<Ty>),
+    /// A cons cell `(car . cdr)` with independently-typed halves.
+    Pair(Box<Ty>, Box<Ty>),
+    /// An interned symbol.
+    Symbol,
+    /// The boxed `LispVal::String` (distinct from `(array char)`).
+    Str,
+    /// An arrow type `(args...) -> ret`, for higher-order checking.
+    Fn(Vec<Ty>, Box<Ty>),
+    /// A **row-typed record** (experimental): a set of labeled fields plus an
+    /// optional row tail. `rest: None` is a closed record (exactly these
+    /// fields); `rest: Some(Var)` is an open one ("these fields, and the
+    /// rest is ρ"). Rows exist only in the *checker's* type language — they
+    /// come from declared schemes (`declare-type!`), never from codegen, and
+    /// `is_compileable` rejects them. Fields are kept sorted by label; a row
+    /// tail may itself resolve to another `Record`, which unification and
+    /// `zonk` flatten.
+    Record(Vec<(String, Ty)>, Option<Box<Ty>>),
+    /// The gradual top type: the operative/`eval`/create-on-assign frontier
+    /// (Wand). It unifies with anything (absorbing) and propagates, so the
+    /// checker stays sound on the applicative island and makes no claim across
+    /// the membrane.
+    Any,
+
+    /// An opaque, call-scoped handle to an arbitrary `LispVal` (issue #476):
+    /// **compileable**, unlike every other type below the `is_compileable`
+    /// line — inert cargo a typed function can carry, pass, return, and store
+    /// in a local/struct field/array slot, without the checker or codegen
+    /// ever looking inside it.
+    ///
+    /// ## Representation: index, not pointer
+    ///
+    /// The runtime word is a **1-based index into `Ctx.boxed`**, a per-call
+    /// root table (`RefCell<Vec<LispVal>>`), not a raw `*const LispVal`. Word
+    /// `0` is reserved to mean `NIL` — both because a freshly `jit_alloc`'d
+    /// (zero-filled) `(array boxed)` then reads as all-`NIL` with no init
+    /// pass, and because it gives every fallible boxed operation (an
+    /// out-of-range handle, a recorded error) a safe, valid substitute value
+    /// to produce instead of panicking. An index cannot dangle the way a raw
+    /// pointer into a growing `Vec<LispVal>` could.
+    ///
+    /// ## Lifetime: call-scoped
+    ///
+    /// The table lives on `Ctx` and is append-only for the duration of one
+    /// top-level membrane call; it drops with the arena when that call
+    /// returns. A handle therefore never outlives the call that produced it,
+    /// and — because handles never enter a `LispVal` themselves — never
+    /// crosses `fork_world`'s deep copy either. There is no GC question to
+    /// answer beyond "the call ends."
+    ///
+    /// ## Aliasing: a feature, not a bug
+    ///
+    /// `Ctx::box_value` stores a **clone** of the `LispVal`. For the
+    /// `Shared`-backed variants (`Array`, `Cons`, `Symbol`, `HashTable`,
+    /// `String` where applicable) that clone shares the same underlying
+    /// `Shared` allocation as the original, so a mutation performed *through*
+    /// a handle (e.g. a `store` via `BoxedAset`) is visible on the caller's
+    /// own object with no write-back path at all — the alias *is* the
+    /// write-back. The inline variants (`Number`, `Float`, `Char`, `Nil`) are
+    /// plain value copies, which is sound precisely because those variants
+    /// are immutable. This is why two handles may denote "the same object"
+    /// in a way plain word-equality of their indices cannot detect: no `Cmp`
+    /// node is ever elaborated at boxed type; identity/equality questions go
+    /// through the `BoxedEqual` intrinsic instead, which defers to
+    /// `PartialEq for LispVal`.
+    Boxed,
+}
+
+impl Ty {
+    /// A type whose runtime word can never be (or lead to) a pointer into the
+    /// call arena: `int64`/`float64`/`bool`/`char`. Gates per-iteration arena
+    /// reclamation at tail-call edges (issue #212, [`Ctx::arena_reclaim`]):
+    /// a function whose every parameter and return type is one of these has
+    /// no way to carry a buffer across a tail hop, nor an older buffer a
+    /// fresh one could be stored into. `Boxed` is excluded on purpose — its
+    /// handle table is a separate, append-only root this change does not
+    /// touch, and keeping it out keeps the proof one line long.
+    pub(super) fn is_reclaim_scalar(&self) -> bool {
+        matches!(self, Ty::Int64 | Ty::Float64 | Ty::Bool | Ty::Char)
+    }
+}
+
+/// Which execution tier a registered typed function will actually run on
+/// (the `compiled-p` introspection builtin, "loud type inference"): the best
+/// available edition, since with the default `jit` feature a function that
+/// has a native edition also keeps its closure edition around (see
+/// [`super::registry::TypedFn`]'s `compiled`/`native` fields) but `invoke`
+/// always prefers native when present.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// A Cranelift-compiled native edition exists (`jit` feature only).
+    Native,
+    /// Only the portable closure edition exists — either the `jit` feature
+    /// is disabled, or Cranelift codegen failed and compilation fell back.
+    Closure,
+}
+
+/// Outcome of [`Jit::analyze_untyped`] (#162 stage 4): the checker's verdict for
+/// an un-annotated function, and whether a native edition was installed.
+pub enum Analysis {
+    /// Well-typed *and* compileable — a native edition was installed. Carries the
+    /// inferred (compileable) type, rendered.
+    Native(String),
+    /// Well-typed but **not** compileable — it type-checks and stays dynamic
+    /// (interpreted). Carries the inferred type scheme, rendered.
+    Checked(String),
+    /// A genuine type error: a clash on the typed island.
+    TypeError(String),
+}
+
+/// Whether `t` lies in the **compileable** sub-lattice — the types codegen can
+/// lower to unboxed machine words/buffers. Checkable-but-not-compileable types
+/// (issue #162) are well-typed but stay interpreted/boxed.
+pub fn is_compileable(t: &Ty) -> bool {
+    match t {
+        Ty::Int64 | Ty::Float64 | Ty::Bool | Ty::Char | Ty::Boxed => true,
+        Ty::Array(e) => is_compileable(e),
+        Ty::Struct(d) => d.fields.iter().all(|(_, ft)| is_compileable(ft)),
+        // A sum's representation varies by constructor: checker-only.
+        Ty::Variant(_) => false,
+        // Parametric nominals are checker-only (erased at runtime).
+        Ty::App(_, _) => false,
+        // A variable is not (yet) compileable until resolved; the rest are
+        // checkable only.
+        Ty::Var(_)
+        | Ty::List(_)
+        | Ty::Pair(_, _)
+        | Ty::Symbol
+        | Ty::Str
+        | Ty::Fn(_, _)
+        | Ty::Record(_, _)
+        | Ty::Any => false,
+    }
+}
+
+/// Whether `t` is a *flat* array of scalars (`(array int64/float64/bool/char)`,
+/// not an array of arrays or an array of structs) — issue #216: this is the
+/// scope `Jit::call_with_array_writeback` writes a mutated argument back
+/// into the caller's backing store for. Excluded on purpose:
+///
+/// - Nested compounds (`(array (array T))`, `(array Struct)`): `from_word`
+///   would rebuild fresh inner `LispVal`s for every element, so writing the
+///   outer buffer back would silently replace inner-object identity for any
+///   other holder of one of those inner values. That is a genuinely new kind
+///   of aliasing bug, not a fix — out of scope for this pass (see #216).
+/// - Structs at the top level: `LispVal::Struct` has no interior mutability
+///   in the first place (`Shared<StructObj>`, not `Shared<SharedCell<_>>>`),
+///   so there is no existing in-place-mutation contract to honor there,
+///   unlike arrays (`LispVal::Array` is `Shared<SharedCell<Vec<LispVal>>>>`,
+///   and `STORE`'s docs explicitly promise in-place mutation).
+pub(super) fn is_flat_scalar_array(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Array(elem) if matches!(**elem, Ty::Int64 | Ty::Float64 | Ty::Bool | Ty::Char)
+    )
+}
+
+/// Whether a [`crate::ElemTy`] (the element type a [`LispVal::TypedArray`]
+/// was created with) agrees with a compileable array element [`Ty`] — the
+/// gate for the zero-copy membrane path in [`Value::to_word`].
+pub fn elem_ty_matches(elem: crate::ElemTy, ty: &Ty) -> bool {
+    matches!(
+        (elem, ty),
+        (crate::ElemTy::Int64, Ty::Int64) | (crate::ElemTy::Float64, Ty::Float64)
+    )
+}
+
+/// A struct type definition: an ordered list of `(field-name, field-type)`. Two
+/// struct types are equal iff they have the same name and field layout; the
+/// `Rc` keeps clones cheap and identity stable.
+#[derive(PartialEq, Eq, Debug)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, Ty)>,
+}
+
+impl StructDef {
+    /// Number of `u64` words one element occupies under the **inline**
+    /// (contiguous array-of-structs) layout for `(array Self)` — jit/
+    /// core-loops array-of-structs follow-up: `[len, e0f0, e0f1, …, e1f0,
+    /// e1f1, …]`, `stride` words per element, no per-element header or
+    /// pointer indirection. Only possible when every field is an unboxed
+    /// scalar word (`int64`/`float64`/`bool`/`char`) — a struct- or
+    /// array-valued field would itself need a header/pointer, which an
+    /// inline slot has no room for — in which case the stride is simply the
+    /// field count (one word each, in declaration order). `None` means this
+    /// struct's arrays must stay the general one-pointer-per-element layout.
+    pub fn stride(&self) -> Option<usize> {
+        if self
+            .fields
+            .iter()
+            .all(|(_, t)| matches!(t, Ty::Int64 | Ty::Float64 | Ty::Bool | Ty::Char))
+        {
+            Some(self.fields.len())
+        } else {
+            None
+        }
+    }
+}
+
+/// A declared sum type: a closed set of constructor brands. Each constructor
+/// is itself a registered record (a [`StructDef`]); the variant is the
+/// checker-level union of those brands — a `CIRCLE` value unifies where a
+/// `SHAPE` is demanded, two variants unify only by name, and nothing else
+/// is a member.
+#[derive(PartialEq, Eq, Debug)]
+pub struct VariantDef {
+    pub name: String,
+    pub ctors: Vec<String>,
+}
+
+/// A PARAMETRIC nominal (0.3 HM generics): a record or variant taking type
+/// parameters. `fields` (records and variant constructors) may reference
+/// the parameters as `Ty::Var(0..arity)` — canonical ids, substituted with
+/// fresh variables or concrete arguments at every use. `ctors` non-empty
+/// marks a variant; `variant` on a constructor names its owning sum. Uses
+/// appear in the type language as applications: `(pair int64 string)`,
+/// `(option a)` — represented as [`Ty::App`].
+#[derive(PartialEq, Eq, Debug)]
+pub struct GenericDef {
+    pub name: String,
+    pub arity: usize,
+    pub fields: Vec<(String, Ty)>,
+    pub ctors: Vec<String>,
+    pub variant: Option<String>,
+}
+
+impl Ty {
+    pub fn parse(name: &str) -> Option<Ty> {
+        match name {
+            "INT64" => Some(Ty::Int64),
+            "FLOAT64" => Some(Ty::Float64),
+            "BOOL" => Some(Ty::Bool),
+            "CHAR" | "U8" | "BYTE" => Some(Ty::Char),
+            "BOXED" => Some(Ty::Boxed),
+            _ => None,
+        }
+    }
+
+    /// Arithmetic interpretation (`+ - * /`). `char` is intentionally excluded:
+    /// byte math is done by widening to `int64` (`char-code`) and narrowing back
+    /// (`code-char`).
+    pub(super) fn as_num(&self) -> Option<NumTy> {
+        match self {
+            Ty::Int64 => Some(NumTy::I),
+            Ty::Float64 => Some(NumTy::F),
+            _ => None,
+        }
+    }
+
+    /// Comparison interpretation. `char` compares as an unsigned-small integer
+    /// (its word holds a `0..=255` byte value), so it reuses the integer path.
+    pub(super) fn cmp_num(&self) -> Option<NumTy> {
+        match self {
+            Ty::Int64 | Ty::Char => Some(NumTy::I),
+            Ty::Float64 => Some(NumTy::F),
+            _ => None,
+        }
+    }
+}
+
+/// Surface-style name of a [`Ty`], matching the `defun-typed` syntax
+/// (`int64`, `float64`, `bool`, `char`, `(array T)`, struct name). Used by
+/// introspection (`describe`, `disassemble`) and diagnostics.
+pub fn ty_name(t: &Ty) -> String {
+    match t {
+        Ty::Int64 => "int64".to_string(),
+        Ty::Float64 => "float64".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Char => "char".to_string(),
+        Ty::Array(e) => format!("(array {})", ty_name(e)),
+        Ty::Struct(s) => s.name.clone(),
+        Ty::Variant(v) => v.name.clone(),
+        Ty::App(d, args) => format!(
+            "({} {})",
+            d.name.to_lowercase(),
+            args.iter().map(ty_name).collect::<Vec<_>>().join(" ")
+        ),
+        // A variable should never survive to a signature/introspection site.
+        Ty::Var(v) => format!("?{v}"),
+        Ty::List(e) => format!("(list {})", ty_name(e)),
+        Ty::Pair(a, b) => format!("(pair {} {})", ty_name(a), ty_name(b)),
+        Ty::Symbol => "symbol".to_string(),
+        Ty::Str => "string".to_string(),
+        Ty::Fn(ps, r) => {
+            let args = ps.iter().map(ty_name).collect::<Vec<_>>().join(" ");
+            format!("(-> ({args}) {})", ty_name(r))
+        }
+        Ty::Record(fields, rest) => {
+            let fs = fields
+                .iter()
+                .map(|(n, t)| format!("({} {})", n.to_lowercase(), ty_name(t)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match rest {
+                Some(r) => format!("(record ({fs}) {})", ty_name(r)),
+                None => format!("(record ({fs}))"),
+            }
+        }
+        Ty::Any => "any".to_string(),
+        Ty::Boxed => "boxed".to_string(),
+    }
+}
+
+/// Which machine interpretation a numeric op uses on its `u64` words.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum NumTy {
+    I,
+    F,
+}
+
+/// A boxed value at the public boundary (the unboxed runtime uses raw `u64`).
+#[derive(Clone, PartialEq, Debug)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    /// A byte value (`0..=255`) at the boundary. Boxes to/from `LispVal::Char`;
+    /// in-range numbers are accepted at input for compatibility.
+    Char(u8),
+    /// A flat array, materialized at the boundary as its element [`Value`]s. The
+    /// runtime word is a pointer into the call arena; this is the copied-out view
+    /// the membrane hands back (or takes in).
+    Array(Vec<Value>),
+    /// A struct, materialized as its field [`Value`]s in declaration order.
+    Struct(Vec<Value>),
+    /// A flat typed array (`LispVal::TypedArray`) crossing the membrane as a
+    /// parameter. Unlike [`Value::Array`], this is not copied out of the
+    /// caller's storage: `data` already uses the same `[len, e0, e1, …]`
+    /// layout as a call-arena array buffer, so [`Value::to_word`] hands the
+    /// native call a pointer straight into it when the element type matches
+    /// (see `to_word`'s `TypedArray` arm) — no copy in, and no write-back
+    /// needed on return since any in-place `store`/`aset` the callee performs
+    /// already lands in the caller's own buffer.
+    TypedArray(Shared<TypedArrayObj>),
+    /// An opaque handle value at the boundary (issue #476): the `LispVal` to
+    /// be boxed into the call's `Ctx.boxed` root table (on the way in via
+    /// [`Value::to_word`]), or the `LispVal` read back out of it (on the way
+    /// out via `Value::from_word`). See [`Ty::Boxed`] for the representation
+    /// and aliasing contract.
+    Boxed(LispVal),
+}
+
+/// Result of a call that also reports post-call array write-back (issue
+/// #216): the ordinary boxed result, plus one entry per argument that is
+/// `Some(updated_value)` when that argument's type is a flat scalar array
+/// (see `is_flat_scalar_array`), `None` otherwise. See
+/// `Jit::call_with_array_writeback`.
+/// Condition flags set by typed arithmetic during a JIT call (issue #228).
+/// The membrane reads these after the call returns and propagates them to
+/// the evaluator (OVERFLOW flag / division-by-zero error).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitFlags {
+    pub overflow: bool,
+    pub div_by_zero: bool,
+}
+
+pub type WritebackResult = Result<(Value, Vec<Option<Value>>, JitFlags), String>;
+
+/// A typed call that distinguishes *declining to enter* native code from
+/// *failing after entering* it (issue #500). A membrane that falls back to a
+/// dynamic closure may do so only on [`JitEntry::Declined`]: once the native
+/// body has started it may already have performed side effects (a `store`
+/// into a zero-copy typed array, a host call), so re-running the body
+/// interpreted would repeat them. [`JitEntry::Entered`] carries the call's
+/// own result, whose `Err` must propagate.
+#[derive(Debug)]
+pub enum JitEntry {
+    /// Rejected before the native body ran (not defined, arity, argument
+    /// lowering); nothing was executed.
+    Declined(String),
+    /// The native body ran; its outcome, success or error.
+    Entered(WritebackResult),
+}
+
+impl Value {
+    /// Lower a boundary value to its runtime `u64` word for a parameter of type
+    /// `ty`, allocating compound values (arrays/structs) into the call arena so
+    /// the resulting pointer word is rooted for the duration of the call.
+    pub(super) fn to_word(&self, ty: &Ty, ctx: &Ctx) -> Result<u64, String> {
+        match (self, ty) {
+            (Value::Int(n), Ty::Int64) => Ok(*n as u64),
+            (Value::Float(f), Ty::Float64) => Ok(f.to_bits()),
+            (Value::Bool(b), Ty::Bool) => Ok(*b as u64),
+            (Value::Char(b), Ty::Char) => Ok(*b as u64),
+            (Value::Int(n), Ty::Char) => Ok(u8::try_from(*n)
+                .map_err(|_| format!("char argument: {n} out of range 0-255"))?
+                as u64),
+            (Value::Array(items), Ty::Array(elem)) => {
+                let buf = ctx.alloc_buffer(items.len());
+                for (i, it) in items.iter().enumerate() {
+                    let w = it.to_word(elem, ctx)?;
+                    unsafe { *buf.add(i + 1) = w };
+                }
+                Ok(buf as u64)
+            }
+            // Zero-copy membrane (issue: JIT TypedArray): `ta.data` is
+            // already `[len, e0, e1, …]`, the exact layout `alloc_buffer`
+            // produces, so when the element type matches the parameter's
+            // declared element type the native call can read/write the
+            // caller's own buffer directly — no arena copy in, no
+            // write-back copy out. A mismatched element type is a genuine
+            // type error (e.g. passing a `float64` typed array where
+            // `(array int64)` is declared): fall through to the generic
+            // mismatch error below rather than silently reinterpreting bits.
+            (Value::TypedArray(ta), Ty::Array(elem)) if elem_ty_matches(ta.elem, elem) => {
+                Ok(ta.data.borrow_mut().as_mut_ptr() as u64)
+            }
+            // Boxing is O(1) regardless of what `lv` is: push a clone into
+            // the call's root table and hand back its 1-based index. `NIL`
+            // shortcuts to word `0` so it needs no table slot at all (and so
+            // a zero-filled `(array boxed)` reads as all-`NIL` for free).
+            (Value::Boxed(lv), Ty::Boxed) => Ok(ctx.box_value(lv.clone())),
+            (Value::Struct(fields), Ty::Struct(def)) => {
+                if fields.len() != def.fields.len() {
+                    return Err(format!(
+                        "struct `{}` expects {} fields, got {}",
+                        def.name,
+                        def.fields.len(),
+                        fields.len()
+                    ));
+                }
+                let buf = ctx.alloc_buffer(fields.len());
+                for (i, (fv, (_, ft))) in fields.iter().zip(def.fields.iter()).enumerate() {
+                    let w = fv.to_word(ft, ctx)?;
+                    unsafe { *buf.add(i + 1) = w };
+                }
+                Ok(buf as u64)
+            }
+            _ => Err(format!(
+                "value {self:?} does not match type {}",
+                ty_name(ty)
+            )),
+        }
+    }
+
+    /// Read a runtime word back into a boundary value of type `ty`, copying
+    /// compound buffers out of the arena (so the result outlives the call).
+    // `ctx` is unused outside the recursive calls today; it starts threading
+    // through here so the boxed arm (issue #476 Phase 2) can resolve a handle
+    // against `ctx`'s root table without another signature-wide ripple.
+    pub(super) fn from_word(w: u64, ty: &Ty, ctx: &Ctx) -> Value {
+        match ty {
+            Ty::Int64 => Value::Int(w as i64),
+            Ty::Float64 => Value::Float(f64::from_bits(w)),
+            Ty::Bool => Value::Bool(w != 0),
+            Ty::Char => Value::Char(w as u8),
+            Ty::Boxed => Value::Boxed(ctx.unbox(w)),
+            Ty::Array(elem) => {
+                let base = w as *const u64;
+                let len = unsafe { *base } as usize;
+                let mut items = Vec::with_capacity(len);
+                for i in 0..len {
+                    let ew = unsafe { *base.add(i + 1) };
+                    items.push(Value::from_word(ew, elem, ctx));
+                }
+                Value::Array(items)
+            }
+            Ty::Struct(def) => {
+                let base = w as *const u64;
+                let mut fields = Vec::with_capacity(def.fields.len());
+                for (i, (_, ft)) in def.fields.iter().enumerate() {
+                    let fw = unsafe { *base.add(i + 1) };
+                    fields.push(Value::from_word(fw, ft, ctx));
+                }
+                Value::Struct(fields)
+            }
+            // Only compileable types cross the membrane: a `Var` is resolved
+            // before storage, and the checkable-only types (#162) never back a
+            // native edition (`is_compileable` is false for them).
+            Ty::Var(_)
+            | Ty::Variant(_)
+            | Ty::App(_, _)
+            | Ty::List(_)
+            | Ty::Pair(_, _)
+            | Ty::Symbol
+            | Ty::Str
+            | Ty::Fn(_, _)
+            | Ty::Record(_, _)
+            | Ty::Any => {
+                unreachable!("from_word on a non-compileable type {}", ty_name(ty))
+            }
+        }
+    }
+}
+
+#[inline]
+pub(super) fn as_i(w: u64) -> i64 {
+    w as i64
+}
+#[inline]
+pub(super) fn from_i(x: i64) -> u64 {
+    x as u64
+}
+#[inline]
+pub(super) fn as_f(w: u64) -> f64 {
+    f64::from_bits(w)
+}
+#[inline]
+pub(super) fn from_f(x: f64) -> u64 {
+    x.to_bits()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    /// Truncated remainder on int64 (`remainder`/`rem`, #522): the sign
+    /// follows the dividend, unlike the Euclidean `Mod`. `MIN rem -1` is 0
+    /// and sets OVERFLOW, matching the evaluator's REMAINDER.
+    Rem,
+    /// Bitwise AND/OR/XOR on int64 (`logand`/`logior`/`logxor`).
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// Left shift `x << y` (`ash` with a positive constant); the right operand
+    /// is always a compile-time constant in `1..=63`, so it never masks. The
+    /// result wraps; `OVERFLOW` is set exactly when bits are lost (#514).
+    Shl,
+    /// Arithmetic right shift `x >> y` (`ash` with a negative constant); right
+    /// operand a compile-time constant in `1..=63`.
+    AShr,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum CmpOp {
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// The typed core IR. Variables are fixed slot indices; calls are function ids.
+#[derive(Clone, Debug)]
+pub enum Core {
+    LitI(i64),
+    LitF(f64),
+    Var(usize),
+    Bin(NumKind, BinOp, Box<Core>, Box<Core>),
+    Cmp(NumKind, CmpOp, Box<Core>, Box<Core>),
+    Not(Box<Core>),
+    And(Box<Core>, Box<Core>),
+    Or(Box<Core>, Box<Core>),
+    If(Box<Core>, Box<Core>, Box<Core>),
+    Let(usize, Box<Core>, Box<Core>),
+    Call(usize, Vec<Core>),
+    /// Narrow an `int64` word to a `char` by masking to a byte (`code-char`).
+    /// The widening direction (`char-code`) needs no node: a `char` word already
+    /// holds the byte value, so it is reused unchanged at type `int64`.
+    ToChar(Box<Core>),
+    /// `(array n)`: allocate a flat `n`-element buffer in the call arena,
+    /// zero-initialized; evaluates to the buffer pointer word (#137/#138).
+    ArrayNew(Box<Core>),
+    /// `(fetch a i)`: bounds-checked element load (out-of-range yields `0`,
+    /// matching the panic-free div-by-zero policy). The word is read per the
+    /// statically-known element type by the surrounding nodes.
+    ArrayGet(Box<Core>, Box<Core>),
+    /// `(store a i v)`: bounds-checked element store (out-of-range is a no-op);
+    /// evaluates to the stored value word.
+    ArraySet(Box<Core>, Box<Core>, Box<Core>),
+    /// `(array-length* a)`: the element count (the buffer header), as `int64`.
+    ArrayLen(Box<Core>),
+    /// `(make-NAME f0 f1 …)`: allocate a struct buffer (one word per field) in
+    /// the call arena and initialize each field in declaration order; evaluates
+    /// to the buffer pointer word.
+    StructNew(Vec<Core>),
+    /// `(NAME-FIELD s)`: load field at the given fixed word offset.
+    FieldGet(Box<Core>, usize),
+    /// `(set-NAME-FIELD s v)`: store field at the given offset; evaluates to the
+    /// stored value word.
+    FieldSet(Box<Core>, usize, Box<Core>),
+    /// A statement sequence: evaluate each in order (for side effects such as
+    /// `store`), yielding the last. Non-empty by construction.
+    Seq(Vec<Core>),
+    /// `(setq var val)` on a local slot: store the value word into the
+    /// slot and evaluate to the stored word. Only elaborated for local
+    /// variables (params and let-bindings); dynamic/global setq stays
+    /// in the tree-walker.
+    Assign(usize, Box<Core>),
+    /// `(while test body)`: evaluate TEST; if truthy (nonzero), evaluate
+    /// BODY for side effects, then loop. Evaluates to 0, typed `bool`
+    /// (NIL, #524).
+    While(Box<Core>, Box<Core>),
+    /// `(for (var start end [step]) body...)`: evaluate START, END, STEP
+    /// once; iterate VAR from START to END (inclusive) by STEP. Direction
+    /// determined by sign of STEP. STEP=0 is an error. Overflow on the
+    /// counter breaks the loop without setting the OVERFLOW flag (matching
+    /// the tree-walker contract at special_forms.rs:106-126). Evaluates
+    /// to 0 (NIL). Statement node.
+    For {
+        slot: usize,
+        start: Box<Core>,
+        end: Box<Core>,
+        step: Box<Core>,
+        body: Box<Core>,
+    },
+    /// A unary floating-point intrinsic over a `float64` argument. The op
+    /// determines the math and the result representation (see [`FUnOp`]).
+    FUnary(FUnOp, Box<Core>),
+    /// A binary floating-point intrinsic (#398) over raw operand words; the
+    /// op fixes each operand's representation (see [`FBinOp`]). Always a
+    /// `float64` result, computed by libm via the `jit_ftrans2` trampoline.
+    FBinary(FBinOp, Box<Core>, Box<Core>),
+    /// `(float x)` on an `int64` argument: widen to `float64` (`fcvt_from_sint`
+    /// natively / `i64 as f64` in the interpreter). `(float x)` on a value that
+    /// is already `float64` needs no node — it elaborates to the argument
+    /// unchanged.
+    IntToFloat(Box<Core>),
+    /// `(array-add!/-sub!/-mul! out a b)`: elementwise binary op over three
+    /// `(array T)` values of the SAME element type `T` (`int64`/`float64`),
+    /// out-param, iterating `min(len out, len a, len b)`. Mutates `out` in
+    /// place and evaluates to `out`'s buffer pointer. Integer arithmetic is
+    /// **wrapping** and never sets `OVERFLOW` — a vector `iadd`/`isub`/`imul`
+    /// cannot set a per-lane flag, so the whole family is defined as wrapping
+    /// (matching `wrapping_add`/`wrapping_sub`/`wrapping_mul`) rather than
+    /// have the scalar tail disagree with the vectorized body. `op` is
+    /// reused from [`BinOp`] (only `Add`/`Sub`/`Mul` are ever constructed
+    /// here); `NumKind` selects int64 vs. float64 lowering. The native
+    /// backend lowers this to a 2-lane SIMD loop (`I64X2`/`F64X2`) plus a
+    /// scalar tail for an odd final element; the Core interpreter and the
+    /// closure backend use a plain scalar loop — elementwise ops have no
+    /// reduction/reassociation, so all three executors agree bit-for-bit.
+    ArrayMap2(BinOp, NumKind, Box<Core>, Box<Core>, Box<Core>),
+    /// The rest of the elementwise array family (#394): `array-div!`,
+    /// `array-scale!`, `array-fma!`, `array-neg!`. Operands are evaluated
+    /// left to right, `out` first; the operand shape is [`ArrOp`]'s. Mutates
+    /// `out` in place over `min(len)` of its array operands and evaluates to
+    /// `out`. The interpreting tiers call the one scalar reference
+    /// (`runtime.rs::array_op`); the native backend lowers it to a 2-lane
+    /// SIMD loop with the same per-element arithmetic (#525; `array-fma!`
+    /// stays fused), so all tiers agree bit-for-bit. Int arithmetic wraps.
+    ArrayOp(ArrOp, NumKind, Vec<Core>),
+    /// `(array-sum a)`: sum of every element of an `(array int64)` or
+    /// `(array float64)`; the [`NumKind`] says which.
+    ///
+    /// **Contract** (aligned with Fortran's `SUM` intrinsic):
+    /// - int64: **wrapping** two's-complement sum. Wrapping addition is
+    ///   associative, so the result is exact and order-independent.
+    /// - float64: a processor-dependent approximation of the mathematical
+    ///   sum. The order of the additions is **unspecified**; an
+    ///   implementation may reassociate freely (lanes, trees, SIMD) to
+    ///   optimize. Programs must not depend on a particular rounding order.
+    ///   Empty input yields `+0.0`; NaN/inf propagate as IEEE addition does.
+    ///
+    /// Implementation note (NOT a language guarantee): every tier here uses
+    /// the shape of [`crate::f64_reduce_by`] — 8 strided lanes, a balanced
+    /// combine, then an in-order tail — so the Core interpreter, the closure
+    /// backend and the native backend (four 2-lane vector accumulators)
+    /// currently agree bit-for-bit.
+    ArraySum(NumKind, Box<Core>),
+    /// `(array-dot a b)`: sum over `i in 0..min(len a, len b)` of
+    /// `a[i] * b[i]`, both arrays of the same element type. int64 wraps
+    /// (products and sum). float64 has the same Fortran-style contract as
+    /// [`Core::ArraySum`]: addition order unspecified. This implementation
+    /// rounds each product (`fmul`, no FMA) and then reduces the products in
+    /// the [`crate::f64_reduce_by`] shape on every tier.
+    ArrayDot(NumKind, Box<Core>, Box<Core>),
+    /// `(array-new-stride n stride)`: allocate a flat array of `n` inline,
+    /// fixed-size (`stride`-word) elements — the contiguous array-of-structs
+    /// layout (jit/core-loops follow-up): `[n, e0f0, e0f1, …, e1f0, e1f1,
+    /// …]`, `stride` words per element, no per-element header or pointer
+    /// indirection. Header word 0 is the *element* count `n` (not the total
+    /// word count `n*stride`), matching every other buffer's `ArrayLen`
+    /// contract. Only ever elaborated by [`stride_walk`] (invoked from
+    /// `elab_let`) for a `let`-bound `(array Struct)` local whose struct is
+    /// all-scalar (see [`StructDef::stride`]) and every use of the binding
+    /// is a recognized safe pattern; [`Core::ArrayNew`] remains the general
+    /// case (and the fallback whenever any use isn't recognized).
+    ArrayNewStride(Box<Core>, usize),
+    /// `(array-set-stride a i stride f0 f1 …)`: bounds-checked, in-place
+    /// initialization of inline element `i` of an [`Core::ArrayNewStride`]
+    /// array — stores each field value directly at `a + 8*(1 + i*stride +
+    /// k)` for field `k`, with no intermediate struct buffer ever
+    /// allocated. Only ever produced by [`stride_walk`] as the fusion of
+    /// `(store a i (make-Struct f0 f1 …))` when `a` is exactly the inline-
+    /// array local being analyzed. Out-of-range `i` records the evaluator's
+    /// index error and is a no-op, matching [`Core::ArraySet`]. A
+    /// **statement** node (evaluates to `0`, like [`Core::While`]/
+    /// [`Core::For`]): there is no single word that could stand for "the
+    /// stored struct" under this layout, so [`stride_walk`] only ever fuses
+    /// a `store` whose own result is provably discarded (see its `discard`
+    /// parameter).
+    ArraySetStride(Box<Core>, Box<Core>, usize, Vec<Core>),
+    /// `(inline-field-get a i field stride)`: bounds-checked load of `field`
+    /// of inline element `i` of an [`Core::ArrayNewStride`] array — `*(a +
+    /// 8*(1 + i*stride + field))` — one load, no interior pointer ever
+    /// materializes as its own value. Only ever produced by [`stride_walk`]
+    /// as the fusion of a struct accessor call `(Struct-field (aref a i))`
+    /// when `a` is the inline-array local being analyzed. Out-of-range `i`
+    /// records the evaluator's index error and substitutes `0`, matching
+    /// [`Core::ArrayGet`].
+    InlineFieldGet(Box<Core>, Box<Core>, usize, usize),
+    /// `(inline-field-set a i field stride v)`: bounds-checked store of `v`
+    /// into `field` of inline element `i` — the fusion of a struct mutator
+    /// call `(set-Struct-field (aref a i) v)`. Evaluates to `v` (mirrors
+    /// [`Core::FieldSet`]); out-of-range `i` records the index error and is
+    /// a no-op.
+    InlineFieldSet(Box<Core>, Box<Core>, usize, usize, Box<Core>),
+    /// A boxed-handle intrinsic (issue #476 phase 3b/3c): the only node that
+    /// looks inside a `Ty::Boxed` handle. See [`BoxedOp`] for what each op
+    /// does and which of `args` it uses. Elaborated from `(equal a b)`,
+    /// `(hash-code x)`, and `(fetch/store/array-length* h ...)` at a boxed
+    /// operand/receiver (`elaboration.rs`, next to `elab_fetch`/`elab_store`/
+    /// `elab_array_len`). All three executors call the single shared
+    /// evaluator [`super::runtime::boxed_op`] — reuse, not reimplementation,
+    /// exactly like [`FUnOp::apply_word`] for the float intrinsics — so the
+    /// tree interpreter, the closure edition, and (via the `jit_boxed_op`
+    /// trampoline) native code agree bit-for-bit.
+    BoxedOp(BoxedOp, Vec<Core>),
+}
+
+/// Boxed-handle intrinsics (issue #476): the only operations allowed to look
+/// inside a `Ty::Boxed` handle. Movement (`Var`/`Let`/`Assign`/`If`/`Call`
+/// argument/return/struct field) needs no `Core` node at all — a handle is
+/// already a plain `u64` word, indistinguishable in machinery from `int64`.
+/// These are the exception: `equal`/`hash-code` compare or hash the boxed
+/// `LispVal` itself, and the array trio index into a general `LispVal::Array`
+/// a handle may denote — crossing as one handle word rather than
+/// element-wise is load-bearing (issue #476 §1(a)), so `fetch`/`store`/
+/// `array-length*` on a boxed receiver must themselves be intrinsics, not a
+/// materialize-then-`Core::ArrayGet` desugaring. `#[repr(u64)]` mirrors
+/// [`FUnOp`] so the native trampoline (`jit_boxed_op`) dispatches on a single
+/// `u64` opcode exactly like `jit_ftrans` does.
+/// The [`Core::ArrayOp`] operations (#394) and their operand shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrOp {
+    /// `(array-div! out a b)`: `out[i] = a[i] / b[i]`, float64 only.
+    Div,
+    /// `(array-scale! out a s)`: `out[i] = a[i] * s`, `s` a scalar.
+    Scale,
+    /// `(array-fma! out a b c)`: `out[i] = a[i] * b[i] + c[i]`; float64 is
+    /// fused (`f64::mul_add`, one rounding), int64 wraps.
+    Fma,
+    /// `(array-neg! out a)`: `out[i] = -a[i]` (int64 wraps; float64 flips
+    /// the sign, so `-0.0` for `0.0`).
+    Neg,
+}
+
+impl ArrOp {
+    /// Number of operands, `out` included.
+    pub fn arity(self) -> usize {
+        match self {
+            ArrOp::Neg => 2,
+            ArrOp::Div | ArrOp::Scale => 3,
+            ArrOp::Fma => 4,
+        }
+    }
+
+    /// Is operand `i` an array (as opposed to the scalar of `Scale`)?
+    pub fn operand_is_array(self, i: usize) -> bool {
+        !(self == ArrOp::Scale && i == 2)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum BoxedOp {
+    /// `(equal a b)` at boxed operands -> `bool` (`0`/`1`). Args: `[a, b]`.
+    /// `PartialEq for LispVal` (`src/lib.rs`) is the exact relation — the one
+    /// `EQUAL` already uses, so this needs no new semantics, only reuse.
+    Equal,
+    /// `(hash-code x)` -> `int64`. Args: `[x]`. Calls `crate::hash_code`, the
+    /// #474 implementation extracted out of `BuiltinFunc::HashCode`, so the
+    /// interpreter builtin and all three typed tiers agree bit-for-bit and
+    /// inherit `EQUAL a b => hash-code a == hash-code b` for free.
+    Hash,
+    /// `(fetch h i)` at a boxed receiver -> handle. Args: `[h, i]`. Indexes
+    /// the general `LispVal::Array` `h` denotes — NOT the flat arena buffer
+    /// `Core::ArrayGet` indexes. Out-of-range or a non-array handle records
+    /// the evaluator's own error (`Ctx::record_index_error` / a type-error
+    /// message) and substitutes the NIL handle (`0`), matching every other
+    /// fallible `Ctx` operation's panic-free discipline.
+    Aref,
+    /// `(store h i v)` at a boxed receiver -> handle (the stored value's own
+    /// handle, mirroring `Core::ArraySet`'s "evaluates to the stored value"
+    /// contract). Args: `[h, i, v]`; `v` is itself a handle — a boxed
+    /// receiver's element is boxed, matching the "boxed is never inferred,
+    /// only where a signature writes it" policy (no silent int/float
+    /// auto-boxing). Mutates the SAME `Shared` allocation the caller's array
+    /// uses (issue #476 §1(b): aliasing is the point, not a copy-in/copy-out
+    /// membrane).
+    Aset,
+    /// `(array-length* h)` at a boxed receiver -> `int64`. Args: `[h]`.
+    Len,
+}
+
+impl BoxedOp {
+    /// The `jit_boxed_op` opcode (the `#[repr(u64)]` discriminant).
+    pub fn opcode(self) -> u64 {
+        self as u64
+    }
+
+    /// Inverse of [`Self::opcode`], for the trampoline. Panics on an unknown
+    /// code — the native backend only ever passes an op's own discriminant.
+    pub fn from_opcode(op: u64) -> BoxedOp {
+        match op {
+            0 => BoxedOp::Equal,
+            1 => BoxedOp::Hash,
+            2 => BoxedOp::Aref,
+            3 => BoxedOp::Aset,
+            4 => BoxedOp::Len,
+            other => panic!("jit_boxed_op: unknown BoxedOp opcode {other}"),
+        }
+    }
+}
+
+/// Unary floating-point intrinsics that lower to native code. Each takes one
+/// `float64` argument. The result is `float64` for the transcendentals and
+/// `int64` for the rounding family (matching the evaluator, whose `floor`/
+/// `ceiling`/`truncate` return an integer). Only ops whose native lowering is
+/// bit-identical to the evaluator's Rust implementation appear here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum FUnOp {
+    /// `sqrt`: `fsqrt` instruction; `float64 -> float64`.
+    Sqrt,
+    /// `floor`: `floor` instruction then saturating `f64 as i64`; `-> int64`.
+    Floor,
+    /// `ceiling`: `ceil` instruction then saturating `f64 as i64`; `-> int64`.
+    Ceil,
+    /// `truncate`: `trunc` instruction then saturating `f64 as i64`; `-> int64`.
+    Trunc,
+    /// `sin`: libm via the `jit_ftrans` trampoline; `float64 -> float64`.
+    Sin,
+    /// `cos`: libm trampoline; `float64 -> float64`.
+    Cos,
+    /// `tan`: libm trampoline; `float64 -> float64`.
+    Tan,
+    /// `exp`: libm trampoline; `float64 -> float64`.
+    Exp,
+    /// `round`: `f64::round` (half away from zero, unlike Cranelift's
+    /// ties-to-even `nearest`) via the trampoline, then `as i64`; `-> int64`.
+    Round,
+    /// `log` (natural, #398): libm trampoline; `float64 -> float64`.
+    Log,
+}
+
+/// Binary float intrinsics (#398), the operands of `expt` in the typed
+/// tiers. Each mirrors one arm of the evaluator's `BuiltinFunc::Expt`
+/// exactly (an int64 base is widened with `IntToFloat` first, which is the
+/// evaluator's `base as f64`). `int64 ^ int64` is never compiled: its result
+/// type depends on the exponent's sign and it can raise overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum FBinOp {
+    /// `float64 ^ float64` -> `x.powf(y)`; both words are float bits.
+    Pow,
+    /// `float64 ^ int64` -> [`float_powi`]`(x, y)`; `y` is an int64 word.
+    PowI,
+}
+
+/// `x ^ e` for a float base and an integer exponent (#507): the evaluator's
+/// `BuiltinFunc::Expt` float^int and int^negative-int arms and
+/// [`FBinOp::PowI`] all call this, so every tier agrees bit for bit.
+/// `powi` when `e` fits in `i32`; otherwise `|x|.powf(e as f64)` with the
+/// sign restored from `e`'s parity (`e as f64` is always even above 2^53,
+/// so `powf` alone would drop the sign of a negative base), which saturates
+/// to `inf`/`0.0` as IEEE `pow` does instead of truncating `e`.
+pub fn float_powi(x: f64, e: i64) -> f64 {
+    match i32::try_from(e) {
+        Ok(e) => x.powi(e),
+        Err(_) => {
+            let m = x.abs().powf(e as f64);
+            if x.is_sign_negative() && e & 1 == 1 {
+                -m
+            } else {
+                m
+            }
+        }
+    }
+}
+
+impl FBinOp {
+    /// Apply the op to raw operand words, returning the float result bits.
+    /// The single source of truth for every tier (the native backend calls
+    /// it through [`super::jit_ftrans2`]).
+    pub fn apply_word(self, x: u64, y: u64) -> u64 {
+        let x = f64::from_bits(x);
+        match self {
+            FBinOp::Pow => x.powf(f64::from_bits(y)).to_bits(),
+            FBinOp::PowI => float_powi(x, y as i64).to_bits(),
+        }
+    }
+
+    /// The `jit_ftrans2` opcode.
+    pub fn opcode(self) -> u64 {
+        self as u64
+    }
+
+    /// Inverse of [`Self::opcode`].
+    pub fn from_opcode(op: u64) -> FBinOp {
+        match op {
+            0 => FBinOp::Pow,
+            1 => FBinOp::PowI,
+            other => panic!("jit_ftrans2: unknown FBinOp opcode {other}"),
+        }
+    }
+}
+
+impl FUnOp {
+    /// Apply the op to an `f64`, returning the result as a raw 64-bit word
+    /// (float bits for `float64` results, the integer value for `int64`
+    /// results). This is the single source of truth: the Core interpreter
+    /// calls it directly, and the native backend either emits the identical
+    /// instruction sequence (the direct ops) or calls [`super::jit_ftrans`],
+    /// which is itself a thin wrapper over this method.
+    pub fn apply_word(self, x: f64) -> u64 {
+        match self {
+            FUnOp::Sqrt => x.sqrt().to_bits(),
+            // `as i64` is saturating in Rust (matches Cranelift `fcvt_to_sint_sat`).
+            FUnOp::Floor => x.floor() as i64 as u64,
+            FUnOp::Ceil => x.ceil() as i64 as u64,
+            FUnOp::Trunc => x.trunc() as i64 as u64,
+            FUnOp::Sin => x.sin().to_bits(),
+            FUnOp::Cos => x.cos().to_bits(),
+            FUnOp::Tan => x.tan().to_bits(),
+            FUnOp::Exp => x.exp().to_bits(),
+            FUnOp::Log => x.ln().to_bits(),
+            FUnOp::Round => x.round() as i64 as u64,
+        }
+    }
+
+    /// True when this op lowers to a libm call (via `jit_ftrans`) rather than a
+    /// direct Cranelift instruction.
+    pub fn is_libm(self) -> bool {
+        matches!(
+            self,
+            FUnOp::Sin | FUnOp::Cos | FUnOp::Tan | FUnOp::Exp | FUnOp::Log | FUnOp::Round
+        )
+    }
+
+    /// The `jit_ftrans` opcode (the `#[repr(u64)]` discriminant).
+    pub fn opcode(self) -> u64 {
+        self as u64
+    }
+
+    /// Inverse of [`Self::opcode`], for the trampoline. Panics on an unknown
+    /// code — the native backend only ever passes an op's own discriminant.
+    pub fn from_opcode(op: u64) -> FUnOp {
+        match op {
+            0 => FUnOp::Sqrt,
+            1 => FUnOp::Floor,
+            2 => FUnOp::Ceil,
+            3 => FUnOp::Trunc,
+            4 => FUnOp::Sin,
+            5 => FUnOp::Cos,
+            6 => FUnOp::Tan,
+            7 => FUnOp::Exp,
+            8 => FUnOp::Round,
+            9 => FUnOp::Log,
+            other => panic!("jit_ftrans: unknown FUnOp opcode {other}"),
+        }
+    }
+}
+
+/// True when `c` is exactly the variable reference for `slot` (the fast
+/// structural check `core_may_mutate_slot` uses to spot a direct write
+/// through a parameter, as opposed to a write reached only through some
+/// other expression that merely *reads* the slot).
+fn is_var_slot(c: &Core, slot: usize) -> bool {
+    matches!(c, Core::Var(s) if *s == slot)
+}
+
+/// Static may-mutate analysis over the elaborated [`Core`] IR (issue #216
+/// follow-up): does any reachable subterm of `core` write through the local
+/// `slot`? A "write" is a direct [`Core::ArraySet`]/[`Core::ArrayMap2`]
+/// out-param/[`Core::FieldSet`] whose target is *exactly* `Core::Var(slot)`
+/// — not merely an expression that reads it. This is deliberately
+/// conservative: it does not attempt alias tracking (e.g. `(let ((b a)) (store
+/// b i v))` is invisible to this pass, since `b`, not `a`, is the direct
+/// target), so a `false` result is a sound guarantee of no write, while a
+/// `true` result may over-approximate. Used by the registry to skip the
+/// post-call write-back copy for array parameters a function provably never
+/// mutates — the worst case for a wrong `true` is a harmless redundant copy,
+/// never a correctness bug.
+pub fn core_may_mutate_slot(core: &Core, slot: usize) -> bool {
+    match core {
+        Core::LitI(_) | Core::LitF(_) | Core::Var(_) => false,
+        Core::Bin(_, _, a, b) | Core::FBinary(_, a, b) | Core::Cmp(_, _, a, b) => {
+            core_may_mutate_slot(a, slot) || core_may_mutate_slot(b, slot)
+        }
+        Core::Not(a) => core_may_mutate_slot(a, slot),
+        Core::And(a, b) | Core::Or(a, b) => {
+            core_may_mutate_slot(a, slot) || core_may_mutate_slot(b, slot)
+        }
+        Core::If(c, t, e) => {
+            core_may_mutate_slot(c, slot)
+                || core_may_mutate_slot(t, slot)
+                || core_may_mutate_slot(e, slot)
+        }
+        Core::Let(_, v, body) => core_may_mutate_slot(v, slot) || core_may_mutate_slot(body, slot),
+        Core::Call(_, args) => args
+            .iter()
+            .any(|a| is_var_slot(a, slot) || core_may_mutate_slot(a, slot)),
+        Core::ToChar(a) => core_may_mutate_slot(a, slot),
+        Core::ArrayNew(n) => core_may_mutate_slot(n, slot),
+        Core::ArrayGet(a, i) => core_may_mutate_slot(a, slot) || core_may_mutate_slot(i, slot),
+        Core::ArraySet(a, i, v) => {
+            is_var_slot(a, slot)
+                || core_may_mutate_slot(a, slot)
+                || core_may_mutate_slot(i, slot)
+                || core_may_mutate_slot(v, slot)
+        }
+        Core::ArrayLen(a) => core_may_mutate_slot(a, slot),
+        Core::StructNew(fields) => fields.iter().any(|f| core_may_mutate_slot(f, slot)),
+        Core::FieldGet(s, _) => core_may_mutate_slot(s, slot),
+        Core::FieldSet(s, _, v) => {
+            is_var_slot(s, slot) || core_may_mutate_slot(s, slot) || core_may_mutate_slot(v, slot)
+        }
+        Core::Seq(items) => items.iter().any(|i| core_may_mutate_slot(i, slot)),
+        Core::Assign(_, v) => core_may_mutate_slot(v, slot),
+        Core::While(c, b) => core_may_mutate_slot(c, slot) || core_may_mutate_slot(b, slot),
+        Core::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            core_may_mutate_slot(start, slot)
+                || core_may_mutate_slot(end, slot)
+                || core_may_mutate_slot(step, slot)
+                || core_may_mutate_slot(body, slot)
+        }
+        Core::FUnary(_, a) => core_may_mutate_slot(a, slot),
+        Core::IntToFloat(a) => core_may_mutate_slot(a, slot),
+        Core::ArrayMap2(_, _, out, a, b) => {
+            is_var_slot(out, slot)
+                || core_may_mutate_slot(out, slot)
+                || core_may_mutate_slot(a, slot)
+                || core_may_mutate_slot(b, slot)
+        }
+        Core::ArraySum(_, a) => core_may_mutate_slot(a, slot),
+        Core::ArrayOp(_, _, xs) => {
+            is_var_slot(&xs[0], slot) || xs.iter().any(|x| core_may_mutate_slot(x, slot))
+        }
+        Core::ArrayDot(_, a, b) => core_may_mutate_slot(a, slot) || core_may_mutate_slot(b, slot),
+        Core::ArrayNewStride(n, _) => core_may_mutate_slot(n, slot),
+        Core::ArraySetStride(a, i, _, fields) => {
+            is_var_slot(a, slot)
+                || core_may_mutate_slot(a, slot)
+                || core_may_mutate_slot(i, slot)
+                || fields.iter().any(|f| core_may_mutate_slot(f, slot))
+        }
+        Core::InlineFieldGet(a, i, _, _) => {
+            core_may_mutate_slot(a, slot) || core_may_mutate_slot(i, slot)
+        }
+        Core::InlineFieldSet(a, i, _, _, v) => {
+            is_var_slot(a, slot)
+                || core_may_mutate_slot(a, slot)
+                || core_may_mutate_slot(i, slot)
+                || core_may_mutate_slot(v, slot)
+        }
+        Core::BoxedOp(_, args) => args.iter().any(|a| core_may_mutate_slot(a, slot)),
+    }
+}
+
+/// Does `core` contain any `Core::Var(slot)` reference anywhere in its tree?
+/// Used to check whether a stride-rewrite candidate slot is referenced in a
+/// sibling `let` binding's initializer.
+pub fn core_references_slot(core: &Core, slot: usize) -> bool {
+    match core {
+        Core::Var(s) => *s == slot,
+        Core::LitI(_) | Core::LitF(_) => false,
+        Core::Bin(_, _, a, b)
+        | Core::FBinary(_, a, b)
+        | Core::Cmp(_, _, a, b)
+        | Core::And(a, b)
+        | Core::Or(a, b)
+        | Core::ArrayGet(a, b)
+        | Core::ArrayDot(_, a, b) => core_references_slot(a, slot) || core_references_slot(b, slot),
+        Core::If(c, t, e) | Core::ArraySet(c, t, e) | Core::ArrayMap2(_, _, c, t, e) => {
+            core_references_slot(c, slot)
+                || core_references_slot(t, slot)
+                || core_references_slot(e, slot)
+        }
+        Core::Not(a)
+        | Core::ToChar(a)
+        | Core::ArrayNew(a)
+        | Core::ArrayLen(a)
+        | Core::ArraySum(_, a)
+        | Core::FUnary(_, a)
+        | Core::IntToFloat(a)
+        | Core::ArrayNewStride(a, _) => core_references_slot(a, slot),
+        Core::Let(_, v, body) | Core::While(v, body) => {
+            core_references_slot(v, slot) || core_references_slot(body, slot)
+        }
+        Core::Assign(_, v) | Core::FieldGet(v, _) => core_references_slot(v, slot),
+        Core::FieldSet(s, _, v) => core_references_slot(s, slot) || core_references_slot(v, slot),
+        Core::Call(_, args) | Core::Seq(args) | Core::StructNew(args) => {
+            args.iter().any(|a| core_references_slot(a, slot))
+        }
+        Core::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            core_references_slot(start, slot)
+                || core_references_slot(end, slot)
+                || core_references_slot(step, slot)
+                || core_references_slot(body, slot)
+        }
+        Core::ArraySetStride(a, i, _, fields) => {
+            core_references_slot(a, slot)
+                || core_references_slot(i, slot)
+                || fields.iter().any(|f| core_references_slot(f, slot))
+        }
+        Core::InlineFieldGet(a, i, _, _) => {
+            core_references_slot(a, slot) || core_references_slot(i, slot)
+        }
+        Core::InlineFieldSet(a, i, _, _, v) => {
+            core_references_slot(a, slot)
+                || core_references_slot(i, slot)
+                || core_references_slot(v, slot)
+        }
+        Core::BoxedOp(_, args) | Core::ArrayOp(_, _, args) => {
+            args.iter().any(|a| core_references_slot(a, slot))
+        }
+    }
+}
+
+/// Escape analysis for a `Core::Let(slot, Core::ArrayNew(_) | Core::StructNew(_),
+/// body)` allocation (jit/core-loops stack-allocation follow-up): does the
+/// value bound to `slot` ever leave `body` — passed to another function,
+/// returned, or stored into another slot that might itself escape? `core`
+/// is the let-binding's `body` (the allocation's whole lexical scope).
+///
+/// A `true` result is always sound (over-approximating is fine — the worst
+/// case is a redundant arena allocation, never a wrong answer); `false`
+/// licenses replacing that arena allocation with a Cranelift `StackSlot`
+/// local to this call frame, since the pointer provably never outlives it.
+///
+/// Deliberately simple (see [`core_may_mutate_slot`] for the same philosophy
+/// applied to a different question): `Core::Var(slot)` is allowed to appear
+/// ONLY as the direct base/target argument of `Core::ArrayGet`,
+/// `Core::ArraySet`, `Core::ArrayLen`, `Core::FieldGet`, or `Core::FieldSet`
+/// — the five forms that merely read/write through the pointer without ever
+/// copying it anywhere else. Any other appearance — a call argument, the
+/// value returned from `body`, the source of an `Assign` to some other slot,
+/// an `ArrayMap2` operand (in *any* of its three positions, including the
+/// out-param — `ArrayMap2` mutates through the pointer like the exempted
+/// forms, but isn't one of them, so it is conservatively treated as an
+/// escape), … — counts as an escape. No alias tracking is attempted (same
+/// caveat as `core_may_mutate_slot`): e.g. `(let ((b a)) (aref b 0))` is
+/// invisible to this pass and reads as an escape of `a` (a bare `Var(a-slot)`
+/// as a `Let` initializer is not one of the five exempt forms), which is
+/// sound (just conservative) since this pass makes no claim about `b`.
+#[cfg_attr(not(feature = "jit"), allow(dead_code))]
+pub fn allocation_escapes(core: &Core, slot: usize) -> bool {
+    match core {
+        Core::LitI(_) | Core::LitF(_) => false,
+        Core::Var(s) => *s == slot,
+        Core::Bin(_, _, a, b) | Core::FBinary(_, a, b) | Core::Cmp(_, _, a, b) => {
+            allocation_escapes(a, slot) || allocation_escapes(b, slot)
+        }
+        Core::Not(a) => allocation_escapes(a, slot),
+        Core::And(a, b) | Core::Or(a, b) => {
+            allocation_escapes(a, slot) || allocation_escapes(b, slot)
+        }
+        Core::If(c, t, e) => {
+            allocation_escapes(c, slot)
+                || allocation_escapes(t, slot)
+                || allocation_escapes(e, slot)
+        }
+        Core::Let(_, v, body) => allocation_escapes(v, slot) || allocation_escapes(body, slot),
+        Core::Call(_, args) => args.iter().any(|a| allocation_escapes(a, slot)),
+        Core::ToChar(a) => allocation_escapes(a, slot),
+        Core::ArrayNew(n) => allocation_escapes(n, slot),
+        Core::ArrayGet(a, i) => {
+            (!is_var_slot(a, slot) && allocation_escapes(a, slot)) || allocation_escapes(i, slot)
+        }
+        Core::ArraySet(a, i, v) => {
+            (!is_var_slot(a, slot) && allocation_escapes(a, slot))
+                || allocation_escapes(i, slot)
+                || allocation_escapes(v, slot)
+        }
+        Core::ArrayLen(a) => !is_var_slot(a, slot) && allocation_escapes(a, slot),
+        Core::StructNew(fields) => fields.iter().any(|f| allocation_escapes(f, slot)),
+        Core::FieldGet(s, _) => !is_var_slot(s, slot) && allocation_escapes(s, slot),
+        Core::FieldSet(s, _, v) => {
+            (!is_var_slot(s, slot) && allocation_escapes(s, slot)) || allocation_escapes(v, slot)
+        }
+        Core::Seq(items) => items.iter().any(|i| allocation_escapes(i, slot)),
+        Core::Assign(_, v) => allocation_escapes(v, slot),
+        Core::While(c, b) => allocation_escapes(c, slot) || allocation_escapes(b, slot),
+        Core::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            allocation_escapes(start, slot)
+                || allocation_escapes(end, slot)
+                || allocation_escapes(step, slot)
+                || allocation_escapes(body, slot)
+        }
+        Core::FUnary(_, a) => allocation_escapes(a, slot),
+        Core::IntToFloat(a) => allocation_escapes(a, slot),
+        Core::ArrayMap2(_, _, o, a, b) => {
+            allocation_escapes(o, slot)
+                || allocation_escapes(a, slot)
+                || allocation_escapes(b, slot)
+        }
+        Core::ArraySum(_, a) => allocation_escapes(a, slot),
+        Core::ArrayOp(_, _, xs) => xs.iter().any(|x| allocation_escapes(x, slot)),
+        Core::ArrayDot(_, a, b) => allocation_escapes(a, slot) || allocation_escapes(b, slot),
+        Core::ArrayNewStride(n, _) => allocation_escapes(n, slot),
+        Core::ArraySetStride(a, i, _, fields) => {
+            (!is_var_slot(a, slot) && allocation_escapes(a, slot))
+                || allocation_escapes(i, slot)
+                || fields.iter().any(|f| allocation_escapes(f, slot))
+        }
+        Core::InlineFieldGet(a, i, _, _) => {
+            (!is_var_slot(a, slot) && allocation_escapes(a, slot)) || allocation_escapes(i, slot)
+        }
+        Core::InlineFieldSet(a, i, _, _, v) => {
+            (!is_var_slot(a, slot) && allocation_escapes(a, slot))
+                || allocation_escapes(i, slot)
+                || allocation_escapes(v, slot)
+        }
+        // A boxed handle is never a `Core::ArrayNew`/`Core::StructNew` arena
+        // buffer, so the `!is_var_slot` stack-alloc exemption other array/
+        // struct ops get never applies here — any reference conservatively
+        // counts as escaping, same philosophy as `Core::Call`'s args.
+        Core::BoxedOp(_, args) => args.iter().any(|a| allocation_escapes(a, slot)),
+    }
+}
+
+/// Public mirror of `NumTy` so [`Core`] can derive `Debug`/`Clone` cleanly.
+#[derive(Clone, Copy, Debug)]
+pub enum NumKind {
+    I,
+    F,
+}
+impl From<NumTy> for NumKind {
+    fn from(n: NumTy) -> Self {
+        match n {
+            NumTy::I => NumKind::I,
+            NumTy::F => NumKind::F,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core-level inlining (jit/core-loops): splice a small, non-recursive,
+// already-defined callee's body directly into a caller's Core tree at
+// `compile_now` time, so the callee's `call_indirect`/`Ctx::call` overhead
+// disappears at that call site entirely. The eligibility decision (budget,
+// recursion) lives in `registry.rs`; this is the pure tree transform.
+// ---------------------------------------------------------------------------
+
+/// Splice every callee in `registry` into `core` wherever it is referenced by
+/// a `Core::Call(id, args)` node. `registry` entries are `(callee_id,
+/// callee_core, callee_n_slots)`, where `callee_n_slots` is the callee's own
+/// total frame size (`TypedFn::n_slots`) — every slot its body can reference
+/// lies in `0..callee_n_slots` (parameters *and* any of its own `let`/`for`
+/// locals), so that many fresh slots are reserved per inlined call site (not
+/// just its parameter count) to keep every reference collision-free against
+/// the caller's existing slots and against other inlined call sites.
+///
+/// Each inlined call site becomes a chain of `Core::Let` bindings — one per
+/// argument, evaluated in order exactly as a real call would — around the
+/// callee's own body with every slot reference shifted into the fresh range.
+/// Everything else is walked and copied structurally unchanged.
+///
+/// Only ONE level of inlining is performed: a `Call` node that appears
+/// *inside* a spliced-in callee body is left as an ordinary call — its own
+/// callee is never looked up in `registry` again during this pass (avoids
+/// inlining into an already-inlined body; deeper inlining, if ever wanted,
+/// falls out of the callee's *own* `compile_now` inlining its own callees
+/// before this function's next (re)compile).
+///
+/// Returns the transformed tree together with the first slot number *not*
+/// used anywhere in it — i.e. the caller's new required `n_slots` (never
+/// smaller than `slot_base`, since a caller with nothing to inline gets its
+/// tree back unchanged and `slot_base` echoed).
+pub fn inline_calls(
+    core: &Core,
+    registry: &[(usize, &Core, usize)],
+    slot_base: usize,
+) -> (Core, usize) {
+    let mut next = slot_base;
+    let out = inline_xform(core, 0, registry, true, &mut next);
+    (out, next)
+}
+
+/// The recursive worker behind [`inline_calls`]. `shift` is added to every
+/// slot index encountered (nonzero only while walking a just-spliced callee
+/// body, to relocate its local slot numbering into the fresh range reserved
+/// for it). `allow_inline` gates whether a `Call` node may itself be spliced
+/// — `false` while walking inside an already-spliced callee body, enforcing
+/// the one-level-only rule.
+fn inline_xform(
+    core: &Core,
+    shift: usize,
+    registry: &[(usize, &Core, usize)],
+    allow_inline: bool,
+    next: &mut usize,
+) -> Core {
+    match core {
+        Core::LitI(n) => Core::LitI(*n),
+        Core::LitF(f) => Core::LitF(*f),
+        Core::Var(i) => Core::Var(i + shift),
+        Core::Not(a) => Core::Not(Box::new(inline_xform(
+            a,
+            shift,
+            registry,
+            allow_inline,
+            next,
+        ))),
+        Core::ToChar(a) => Core::ToChar(Box::new(inline_xform(
+            a,
+            shift,
+            registry,
+            allow_inline,
+            next,
+        ))),
+        Core::FUnary(op, a) => Core::FUnary(
+            *op,
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+        ),
+        Core::IntToFloat(a) => Core::IntToFloat(Box::new(inline_xform(
+            a,
+            shift,
+            registry,
+            allow_inline,
+            next,
+        ))),
+        Core::Bin(k, op, a, b) => Core::Bin(
+            *k,
+            *op,
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::FBinary(op, a, b) => Core::FBinary(
+            *op,
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::Cmp(k, op, a, b) => Core::Cmp(
+            *k,
+            *op,
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::And(a, b) => Core::And(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::Or(a, b) => Core::Or(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::If(c, t, e) => Core::If(
+            Box::new(inline_xform(c, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(t, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(e, shift, registry, allow_inline, next)),
+        ),
+        Core::Let(slot, v, body) => Core::Let(
+            slot + shift,
+            Box::new(inline_xform(v, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(body, shift, registry, allow_inline, next)),
+        ),
+        Core::Call(id, args) => {
+            let new_args: Vec<Core> = args
+                .iter()
+                .map(|a| inline_xform(a, shift, registry, allow_inline, next))
+                .collect();
+            if allow_inline && let Some(entry) = registry.iter().find(|e| e.0 == *id) {
+                let (_, callee_core, callee_slots) = *entry;
+                let base = *next;
+                *next += callee_slots;
+                // The spliced body's own slots (and any deeper calls it
+                // makes) are relocated by `base`; `allow_inline: false`
+                // enforces the one-level-only rule.
+                let inlined_body = inline_xform(callee_core, base, registry, false, next);
+                let mut wrapped = inlined_body;
+                for (i, a) in new_args.into_iter().enumerate().rev() {
+                    wrapped = Core::Let(base + i, Box::new(a), Box::new(wrapped));
+                }
+                return wrapped;
+            }
+            Core::Call(*id, new_args)
+        }
+        Core::ArrayNew(a) => Core::ArrayNew(Box::new(inline_xform(
+            a,
+            shift,
+            registry,
+            allow_inline,
+            next,
+        ))),
+        Core::ArrayGet(a, b) => Core::ArrayGet(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::ArraySet(a, b, c) => Core::ArraySet(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(c, shift, registry, allow_inline, next)),
+        ),
+        Core::ArrayLen(a) => Core::ArrayLen(Box::new(inline_xform(
+            a,
+            shift,
+            registry,
+            allow_inline,
+            next,
+        ))),
+        Core::StructNew(items) => Core::StructNew(
+            items
+                .iter()
+                .map(|c| inline_xform(c, shift, registry, allow_inline, next))
+                .collect(),
+        ),
+        Core::FieldGet(s, idx) => Core::FieldGet(
+            Box::new(inline_xform(s, shift, registry, allow_inline, next)),
+            *idx,
+        ),
+        Core::FieldSet(s, idx, v) => Core::FieldSet(
+            Box::new(inline_xform(s, shift, registry, allow_inline, next)),
+            *idx,
+            Box::new(inline_xform(v, shift, registry, allow_inline, next)),
+        ),
+        Core::Seq(items) => Core::Seq(
+            items
+                .iter()
+                .map(|c| inline_xform(c, shift, registry, allow_inline, next))
+                .collect(),
+        ),
+        Core::Assign(slot, v) => Core::Assign(
+            slot + shift,
+            Box::new(inline_xform(v, shift, registry, allow_inline, next)),
+        ),
+        Core::While(t, b) => Core::While(
+            Box::new(inline_xform(t, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::For {
+            slot,
+            start,
+            end,
+            step,
+            body,
+        } => Core::For {
+            slot: slot + shift,
+            start: Box::new(inline_xform(start, shift, registry, allow_inline, next)),
+            end: Box::new(inline_xform(end, shift, registry, allow_inline, next)),
+            step: Box::new(inline_xform(step, shift, registry, allow_inline, next)),
+            body: Box::new(inline_xform(body, shift, registry, allow_inline, next)),
+        },
+        Core::ArrayMap2(op, k, o, a, b) => Core::ArrayMap2(
+            *op,
+            *k,
+            Box::new(inline_xform(o, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::ArrayOp(op, k, xs) => Core::ArrayOp(
+            *op,
+            *k,
+            xs.iter()
+                .map(|x| inline_xform(x, shift, registry, allow_inline, next))
+                .collect(),
+        ),
+        Core::ArraySum(k, a) => Core::ArraySum(
+            *k,
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+        ),
+        Core::ArrayDot(k, a, b) => Core::ArrayDot(
+            *k,
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(b, shift, registry, allow_inline, next)),
+        ),
+        Core::ArrayNewStride(n, stride) => Core::ArrayNewStride(
+            Box::new(inline_xform(n, shift, registry, allow_inline, next)),
+            *stride,
+        ),
+        Core::ArraySetStride(a, i, stride, fields) => Core::ArraySetStride(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(i, shift, registry, allow_inline, next)),
+            *stride,
+            fields
+                .iter()
+                .map(|f| inline_xform(f, shift, registry, allow_inline, next))
+                .collect(),
+        ),
+        Core::InlineFieldGet(a, i, field, stride) => Core::InlineFieldGet(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(i, shift, registry, allow_inline, next)),
+            *field,
+            *stride,
+        ),
+        Core::InlineFieldSet(a, i, field, stride, v) => Core::InlineFieldSet(
+            Box::new(inline_xform(a, shift, registry, allow_inline, next)),
+            Box::new(inline_xform(i, shift, registry, allow_inline, next)),
+            *field,
+            *stride,
+            Box::new(inline_xform(v, shift, registry, allow_inline, next)),
+        ),
+        Core::BoxedOp(op, args) => Core::BoxedOp(
+            *op,
+            args.iter()
+                .map(|a| inline_xform(a, shift, registry, allow_inline, next))
+                .collect(),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Array-of-structs inline layout (jit/core-loops follow-up): fuse a
+// `let`-bound `(array Struct)` local into the contiguous, stride-based
+// layout when every use of the binding is a statically recognized safe
+// pattern. See `elab_let` (elaboration.rs) for the call site.
+// ---------------------------------------------------------------------------
+
+/// Static context threaded through [`stride_walk`]: everything it needs to
+/// recognize a struct-array binding's accessor/mutator/constructor call
+/// sites by registry id.
+pub(super) struct StrideCtx {
+    /// The local slot holding the candidate inline-struct array.
+    pub slot: usize,
+    /// Words per element ([`StructDef::stride`]).
+    pub stride: usize,
+    /// Registry id of the struct's `MAKE-<Name>` constructor.
+    pub ctor_id: usize,
+    /// Registry id of each per-field accessor (`<Name>-<field>`) -> field index.
+    pub getters: HashMap<usize, usize>,
+    /// Registry id of each per-field mutator (`SET-<Name>-<field>`) -> field index.
+    pub setters: HashMap<usize, usize>,
+}
+
+/// Validate every reachable use of `sc.slot` in `core` and, where it matches
+/// a recognized safe pattern, rewrite it to the inline stride-based
+/// primitives; on the FIRST unrecognized use of `sc.slot`, abort the whole
+/// rewrite (`Err(())`) so the caller ([`super::elaboration::Cx::elab_let`])
+/// falls back to the ordinary, unchanged array layout for that binding —
+/// this is purely an optimization, so any doubt must resolve to "don't".
+///
+/// Recognized patterns (everywhere else `Var(sc.slot)` appears is a
+/// conservative abort, exactly as [`allocation_escapes`]'s philosophy):
+/// - `Core::ArrayLen(Var(slot))` — the header word is still the element
+///   count under the inline layout, so this needs no rewriting at all.
+/// - `Core::Call(getter_id, [ArrayGet(Var(slot), i)])`, where `getter_id` is
+///   a known per-field accessor of the struct — becomes
+///   `Core::InlineFieldGet`.
+/// - `Core::Call(setter_id, [ArrayGet(Var(slot), i), v])`, where `setter_id`
+///   is a known per-field mutator — becomes `Core::InlineFieldSet`.
+/// - `Core::ArraySet(Var(slot), i, Core::Call(ctor_id, fields))`, where
+///   `ctor_id` is the struct's own constructor, AND this particular `store`
+///   is in a **discarded** position (`discard` is `true`) — becomes
+///   `Core::ArraySetStride`. `discard` is `false` only where the node's own
+///   result could be observed (e.g. a `let` initializer, a call argument,
+///   the tail value of the binding's own body): under the inline layout
+///   there is no single word that can stand in for "the stored struct", so
+///   a `store` whose value might be read is left unfused — which the
+///   generic `ArraySet` arm below then rejects (since its target is
+///   `Var(slot)` and it isn't a bare recognized case), aborting the whole
+///   rewrite. `Core::While`/`Core::For` bodies and all but the last element
+///   of a `Core::Seq` are always discarding positions, matching those
+///   constructs' own "statement, value ignored" contracts elsewhere in this
+///   IR.
+///
+/// `sc.slot` reused by an unrelated *nested* (inner) `let`'s OWN
+/// already-stride-rewritten subtree is impossible here: nested lexical
+/// scopes only ever get strictly *larger* fresh slot numbers before they
+/// are ever visible to an enclosing rewrite (`Scope::truncate` only runs
+/// after `elab_let` returns up the call stack), so this function never
+/// walks into another rewrite pass's output for the *same* slot number —
+/// though it may walk into one for a *different* (inner) slot, which is
+/// simply structurally recursed through like any other subtree.
+pub(super) fn stride_walk(core: &Core, sc: &StrideCtx, discard: bool) -> Result<Core, ()> {
+    match core {
+        Core::LitI(n) => Ok(Core::LitI(*n)),
+        Core::LitF(f) => Ok(Core::LitF(*f)),
+        Core::Var(s) => {
+            if *s == sc.slot {
+                Err(())
+            } else {
+                Ok(Core::Var(*s))
+            }
+        }
+        Core::Bin(k, op, a, b) => Ok(Core::Bin(
+            *k,
+            *op,
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        Core::FBinary(op, a, b) => Ok(Core::FBinary(
+            *op,
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        Core::Cmp(k, op, a, b) => Ok(Core::Cmp(
+            *k,
+            *op,
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        Core::Not(a) => Ok(Core::Not(Box::new(stride_walk(a, sc, false)?))),
+        Core::And(a, b) => Ok(Core::And(
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        Core::Or(a, b) => Ok(Core::Or(
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        Core::If(c, t, e) => Ok(Core::If(
+            Box::new(stride_walk(c, sc, false)?),
+            Box::new(stride_walk(t, sc, discard)?),
+            Box::new(stride_walk(e, sc, discard)?),
+        )),
+        Core::Let(slot2, v, body) => Ok(Core::Let(
+            *slot2,
+            Box::new(stride_walk(v, sc, false)?),
+            Box::new(stride_walk(body, sc, discard)?),
+        )),
+        Core::Call(id, args) => {
+            if let Some(&field_idx) = sc.getters.get(id)
+                && let [Core::ArrayGet(base, idx)] = args.as_slice()
+                && is_var_slot(base, sc.slot)
+            {
+                let idx_c = stride_walk(idx, sc, false)?;
+                return Ok(Core::InlineFieldGet(
+                    Box::new(Core::Var(sc.slot)),
+                    Box::new(idx_c),
+                    field_idx,
+                    sc.stride,
+                ));
+            }
+            if let Some(&field_idx) = sc.setters.get(id)
+                && let [Core::ArrayGet(base, idx), val] = args.as_slice()
+                && is_var_slot(base, sc.slot)
+            {
+                let idx_c = stride_walk(idx, sc, false)?;
+                let val_c = stride_walk(val, sc, false)?;
+                return Ok(Core::InlineFieldSet(
+                    Box::new(Core::Var(sc.slot)),
+                    Box::new(idx_c),
+                    field_idx,
+                    sc.stride,
+                    Box::new(val_c),
+                ));
+            }
+            let mut new_args = Vec::with_capacity(args.len());
+            for a in args {
+                new_args.push(stride_walk(a, sc, false)?);
+            }
+            Ok(Core::Call(*id, new_args))
+        }
+        Core::ToChar(a) => Ok(Core::ToChar(Box::new(stride_walk(a, sc, false)?))),
+        Core::ArrayNew(n) => Ok(Core::ArrayNew(Box::new(stride_walk(n, sc, false)?))),
+        Core::ArrayGet(a, i) => {
+            if is_var_slot(a, sc.slot) {
+                return Err(());
+            }
+            Ok(Core::ArrayGet(
+                Box::new(stride_walk(a, sc, false)?),
+                Box::new(stride_walk(i, sc, false)?),
+            ))
+        }
+        Core::ArraySet(a, i, v) => {
+            if is_var_slot(a, sc.slot) {
+                if !discard {
+                    return Err(());
+                }
+                if let Core::Call(id, cargs) = v.as_ref()
+                    && *id == sc.ctor_id
+                {
+                    let idx_c = stride_walk(i, sc, false)?;
+                    let mut field_cores = Vec::with_capacity(cargs.len());
+                    for c in cargs {
+                        field_cores.push(stride_walk(c, sc, false)?);
+                    }
+                    return Ok(Core::ArraySetStride(
+                        Box::new(Core::Var(sc.slot)),
+                        Box::new(idx_c),
+                        sc.stride,
+                        field_cores,
+                    ));
+                }
+                return Err(());
+            }
+            Ok(Core::ArraySet(
+                Box::new(stride_walk(a, sc, false)?),
+                Box::new(stride_walk(i, sc, false)?),
+                Box::new(stride_walk(v, sc, false)?),
+            ))
+        }
+        Core::ArrayLen(a) => {
+            if is_var_slot(a, sc.slot) {
+                Ok(Core::ArrayLen(Box::new(Core::Var(sc.slot))))
+            } else {
+                Ok(Core::ArrayLen(Box::new(stride_walk(a, sc, false)?)))
+            }
+        }
+        Core::StructNew(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                out.push(stride_walk(f, sc, false)?);
+            }
+            Ok(Core::StructNew(out))
+        }
+        Core::FieldGet(s, idx) => Ok(Core::FieldGet(Box::new(stride_walk(s, sc, false)?), *idx)),
+        Core::FieldSet(s, idx, v) => Ok(Core::FieldSet(
+            Box::new(stride_walk(s, sc, false)?),
+            *idx,
+            Box::new(stride_walk(v, sc, false)?),
+        )),
+        Core::Seq(items) => {
+            let n = items.len();
+            let mut out = Vec::with_capacity(n);
+            for (i, it) in items.iter().enumerate() {
+                let d = if i + 1 == n { discard } else { true };
+                out.push(stride_walk(it, sc, d)?);
+            }
+            Ok(Core::Seq(out))
+        }
+        Core::Assign(slot2, v) => {
+            if *slot2 == sc.slot {
+                return Err(());
+            }
+            Ok(Core::Assign(*slot2, Box::new(stride_walk(v, sc, false)?)))
+        }
+        Core::While(t, b) => Ok(Core::While(
+            Box::new(stride_walk(t, sc, false)?),
+            Box::new(stride_walk(b, sc, true)?),
+        )),
+        Core::For {
+            slot: fslot,
+            start,
+            end,
+            step,
+            body,
+        } => Ok(Core::For {
+            slot: *fslot,
+            start: Box::new(stride_walk(start, sc, false)?),
+            end: Box::new(stride_walk(end, sc, false)?),
+            step: Box::new(stride_walk(step, sc, false)?),
+            body: Box::new(stride_walk(body, sc, true)?),
+        }),
+        Core::FUnary(op, a) => Ok(Core::FUnary(*op, Box::new(stride_walk(a, sc, false)?))),
+        Core::IntToFloat(a) => Ok(Core::IntToFloat(Box::new(stride_walk(a, sc, false)?))),
+        Core::ArrayMap2(op, k, o, a, b) => Ok(Core::ArrayMap2(
+            *op,
+            *k,
+            Box::new(stride_walk(o, sc, false)?),
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        Core::ArraySum(k, a) => Ok(Core::ArraySum(*k, Box::new(stride_walk(a, sc, false)?))),
+        Core::ArrayOp(op, k, xs) => Ok(Core::ArrayOp(
+            *op,
+            *k,
+            xs.iter()
+                .map(|x| stride_walk(x, sc, false))
+                .collect::<Result<_, _>>()?,
+        )),
+        Core::ArrayDot(k, a, b) => Ok(Core::ArrayDot(
+            *k,
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(b, sc, false)?),
+        )),
+        // Already-rewritten subtrees, from a nested (inner) let's own stride
+        // pass over a *different* (always strictly larger, see this
+        // function's doc comment) slot: structurally opaque as far as
+        // `sc.slot` is concerned, so just recurse.
+        Core::ArrayNewStride(n, stride) => Ok(Core::ArrayNewStride(
+            Box::new(stride_walk(n, sc, false)?),
+            *stride,
+        )),
+        Core::ArraySetStride(a, i, stride, fields) => {
+            let a2 = stride_walk(a, sc, false)?;
+            let i2 = stride_walk(i, sc, false)?;
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                out.push(stride_walk(f, sc, false)?);
+            }
+            Ok(Core::ArraySetStride(
+                Box::new(a2),
+                Box::new(i2),
+                *stride,
+                out,
+            ))
+        }
+        Core::InlineFieldGet(a, i, field, stride) => Ok(Core::InlineFieldGet(
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(i, sc, false)?),
+            *field,
+            *stride,
+        )),
+        Core::InlineFieldSet(a, i, field, stride, v) => Ok(Core::InlineFieldSet(
+            Box::new(stride_walk(a, sc, false)?),
+            Box::new(stride_walk(i, sc, false)?),
+            *field,
+            *stride,
+            Box::new(stride_walk(v, sc, false)?),
+        )),
+        // No recognized pattern touches a boxed intrinsic's operands: a bare
+        // `Var(sc.slot)` anywhere inside conservatively aborts the whole
+        // rewrite via the `Core::Var` arm above, same as an unrecognized call
+        // argument.
+        Core::BoxedOp(op, args) => {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                out.push(stride_walk(a, sc, false)?);
+            }
+            Ok(Core::BoxedOp(*op, out))
+        }
+    }
+}

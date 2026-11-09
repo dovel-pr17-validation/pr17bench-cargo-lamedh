@@ -1,0 +1,302 @@
+//! Differential OVERFLOW / division-error parity tests between the
+//! tree-walking evaluator and the typed JIT membrane (issue #210).
+//!
+//! The brutal_correctness suite compares result *values* across tiers but its
+//! oracle bakes wrapping arithmetic and div-by-zero-is-0 into itself, so the
+//! OVERFLOW flag and the Division-by-zero error contract were unchecked for
+//! parity. Each test here runs the same arithmetic boundary case through (1)
+//! the plain evaluator and (2) an equivalent `defun-typed` call, and asserts
+//! the observable outcome — the `OVERFLOW` flag via `FLAG-SET-P`, the wrapped
+//! result value, and error-vs-value behavior — is identical.
+
+use lamedh::environment::Environment;
+use lamedh::eval_line;
+
+/// Evaluate `expr` in a fresh env, returning (result-or-error-string,
+/// overflow-flag-afterwards). `expr` must be a single form.
+fn run_evaluator(expr: &str) -> (String, bool) {
+    let env = Environment::new_with_builtins();
+    eval_line("(clear-all-flags)", &env);
+    let result = eval_line(expr, &env);
+    let flag = eval_line("(flag-set-p 'OVERFLOW)", &env);
+    (result, flag == "T")
+}
+
+/// Define `defun-typed` form(s), then call `call`, returning the same
+/// (result-or-error-string, overflow-flag) pair through the typed membrane.
+fn run_typed(defs: &[&str], call: &str) -> (String, bool) {
+    let env = Environment::new_with_builtins();
+    for d in defs {
+        let out = eval_line(d, &env);
+        assert!(
+            !out.to_lowercase().contains("error"),
+            "typed definition failed: {d} -> {out}"
+        );
+    }
+    eval_line("(clear-all-flags)", &env);
+    let result = eval_line(call, &env);
+    let flag = eval_line("(flag-set-p 'OVERFLOW)", &env);
+    (result, flag == "T")
+}
+
+const MAX: &str = "9223372036854775807";
+const MIN: &str = "-9223372036854775808";
+
+#[test]
+fn overflow_flag_parity_on_addition() {
+    let (ev_val, ev_flag) = run_evaluator(&format!("(+ {MAX} 1)"));
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tadd int64) ((x int64)) (+ x 1))"],
+        &format!("(tadd {MAX})"),
+    );
+    assert_eq!(ev_flag, ty_flag, "OVERFLOW flag parity on MAX+1");
+    assert!(ev_flag, "evaluator must set OVERFLOW on MAX+1");
+    assert_eq!(ev_val, ty_val, "wrapped value parity on MAX+1");
+}
+
+#[test]
+fn overflow_flag_parity_on_subtraction() {
+    let (ev_val, ev_flag) = run_evaluator(&format!("(- {MIN} 1)"));
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tsub int64) ((x int64)) (- x 1))"],
+        &format!("(tsub {MIN})"),
+    );
+    assert_eq!(ev_flag, ty_flag, "OVERFLOW flag parity on MIN-1");
+    assert!(ev_flag, "evaluator must set OVERFLOW on MIN-1");
+    assert_eq!(ev_val, ty_val, "wrapped value parity on MIN-1");
+}
+
+#[test]
+fn overflow_flag_parity_on_multiplication() {
+    let (ev_val, ev_flag) = run_evaluator(&format!("(* {MAX} 2)"));
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tmul int64) ((x int64)) (* x 2))"],
+        &format!("(tmul {MAX})"),
+    );
+    assert_eq!(ev_flag, ty_flag, "OVERFLOW flag parity on MAX*2");
+    assert!(ev_flag, "evaluator must set OVERFLOW on MAX*2");
+    assert_eq!(ev_val, ty_val, "wrapped value parity on MAX*2");
+}
+
+#[test]
+fn overflow_flag_parity_on_min_div_negative_one() {
+    let (ev_val, ev_flag) = run_evaluator(&format!("(/ {MIN} -1)"));
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tdiv int64) ((x int64) (y int64)) (/ x y))"],
+        &format!("(tdiv {MIN} -1)"),
+    );
+    assert_eq!(ev_flag, ty_flag, "OVERFLOW flag parity on MIN/-1");
+    assert!(ev_flag, "evaluator must set OVERFLOW on MIN/-1");
+    assert_eq!(ev_val, ty_val, "wrapped value parity on MIN/-1");
+}
+
+#[test]
+fn overflow_flag_parity_on_min_mod_negative_one() {
+    // MOD is Euclidean in both worlds (#280): MIN % -1 is exactly 0 and
+    // sets NO flag — the OVERFLOW flag #228/#268 gave the typed MOD had
+    // assumed the truncated-remainder semantics of REMAINDER.
+    let (ev_val, ev_flag) = run_evaluator(&format!("(mod {MIN} -1)"));
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tmod int64) ((x int64) (y int64)) (mod x y))"],
+        &format!("(tmod {MIN} -1)"),
+    );
+    assert_eq!(ev_flag, ty_flag, "OVERFLOW flag parity on MIN%-1");
+    assert!(
+        !ev_flag,
+        "MIN%-1 is exactly 0 under Euclidean MOD — no flag"
+    );
+    assert_eq!(ev_val, ty_val, "value parity on MIN%-1");
+    assert_eq!(ev_val, "0");
+}
+
+#[test]
+fn mod_value_parity_on_negative_operands() {
+    let (ev_val, ev_flag) = run_evaluator("(mod -7 3)");
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tmod int64) ((x int64) (y int64)) (mod x y))"],
+        "(tmod -7 3)",
+    );
+    assert_eq!(ev_val, ty_val, "MOD value parity on (-7, 3)");
+    assert_eq!(ev_val, "2", "evaluator MOD is Euclidean");
+    assert_eq!(ev_flag, ty_flag, "no flags on ordinary mod");
+}
+
+#[test]
+fn division_by_zero_errors_in_both_worlds() {
+    let (ev_val, _) = run_evaluator("(/ 1 0)");
+    let (ty_val, _) = run_typed(
+        &["(defun-typed (tdiv int64) ((x int64) (y int64)) (/ x y))"],
+        "(tdiv 1 0)",
+    );
+    assert!(
+        ev_val.contains("Division by zero"),
+        "evaluator div-by-zero must error, got: {ev_val}"
+    );
+    assert!(
+        ty_val.contains("Division by zero"),
+        "typed div-by-zero must error identically, got: {ty_val}"
+    );
+}
+
+#[test]
+fn mod_by_zero_errors_in_both_worlds() {
+    let (ev_val, _) = run_evaluator("(mod 1 0)");
+    let (ty_val, _) = run_typed(
+        &["(defun-typed (tmod int64) ((x int64) (y int64)) (mod x y))"],
+        "(tmod 1 0)",
+    );
+    assert!(
+        ev_val.to_lowercase().contains("zero"),
+        "evaluator mod-by-zero must error, got: {ev_val}"
+    );
+    assert!(
+        ty_val.to_lowercase().contains("zero"),
+        "typed mod-by-zero must error identically, got: {ty_val}"
+    );
+}
+
+#[test]
+fn no_flag_on_clean_typed_arithmetic() {
+    // The typed membrane must not leak spurious flags for non-overflowing work.
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tclean int64) ((x int64)) (+ (* x 2) 1))"],
+        "(tclean 20)",
+    );
+    assert_eq!(ty_val, "41");
+    assert!(!ty_flag, "clean typed arithmetic must not set OVERFLOW");
+}
+
+#[test]
+fn overflow_flag_parity_before_div_error() {
+    // Issue #268: when a single call both overflows and divides by zero, the
+    // OVERFLOW flag must be recorded before the division error surfaces —
+    // in both worlds.
+    let (ev_val, ev_flag) = run_evaluator(&format!("(/ (+ {MAX} 1) 0)"));
+    let (ty_val, ty_flag) = run_typed(
+        &["(defun-typed (tboth int64) ((x int64)) (/ (+ x 1) 0))"],
+        &format!("(tboth {MAX})"),
+    );
+    assert!(
+        ev_val.contains("Division by zero") && ty_val.contains("Division by zero"),
+        "both worlds must raise the division error (ev: {ev_val}, ty: {ty_val})"
+    );
+    assert_eq!(
+        ev_flag, ty_flag,
+        "OVERFLOW-before-div-error ordering parity"
+    );
+    assert!(ev_flag, "evaluator must keep the OVERFLOW flag set");
+}
+
+#[test]
+fn for_overflow_break_does_not_set_overflow_flag() {
+    // A FOR loop whose counter overflows on increment silently breaks
+    // (special_forms.rs::eval_for's checked_add contract) rather than
+    // setting OVERFLOW like ordinary `+` does — in every typed-JIT edition,
+    // matching the plain-evaluator `for` special form.
+    let (ev_val, ev_flag) = run_evaluator(&format!(
+        "(let ((acc 0)) (for (i {MAX} {MAX} 1) (setq acc (+ acc 1))) acc)"
+    ));
+    let (ty_val, ty_flag) = run_typed(
+        &[&format!(
+            "(defun-typed (tfor int64) () \
+               (let-typed ((acc int64 0)) (for (i {MAX} {MAX} 1) (setq acc (+ acc 1))) acc))"
+        )],
+        "(tfor)",
+    );
+    assert_eq!(ev_val, ty_val, "for-overflow-break value parity");
+    assert_eq!(
+        ev_val, "1",
+        "exactly one iteration should run before the overflow break"
+    );
+    assert_eq!(
+        ev_flag, ty_flag,
+        "OVERFLOW flag parity on for-loop overflow break"
+    );
+    assert!(
+        !ev_flag,
+        "the evaluator's for must not set OVERFLOW on a checked_add break"
+    );
+    assert!(
+        !ty_flag,
+        "the typed for must not set OVERFLOW on a checked_add break either"
+    );
+}
+
+#[test]
+fn for_zero_step_errors_in_both_worlds() {
+    let (ev_val, _) = run_evaluator("(let ((acc 0)) (for (i 1 5 0) (setq acc (+ acc i))) acc)");
+    let (ty_val, _) = run_typed(
+        &["(defun-typed (tfor int64) () \
+             (let-typed ((acc int64 0)) (for (i 1 5 0) (setq acc (+ acc i))) acc))"],
+        "(tfor)",
+    );
+    assert!(
+        ev_val.contains("step must be non-zero"),
+        "evaluator zero-step for must error, got: {ev_val}"
+    );
+    assert!(
+        ty_val.contains("step must be non-zero"),
+        "typed zero-step for must error identically, got: {ty_val}"
+    );
+}
+
+/// Issue #514: `ash` edge cases. `(value, shift, expected result, expected
+/// OVERFLOW)`. OVERFLOW is set exactly when a left shift loses bits; a right
+/// shift never sets it; a shift of `i64::MIN` saturates instead of wrapping
+/// to a no-op.
+const ASH_CASES: &[(i64, i64, i64, bool)] = &[
+    (1, i64::MIN, 0, false),
+    (-1, i64::MIN, -1, false),
+    (5, i64::MIN, 0, false),
+    (i64::MAX, i64::MIN, 0, false),
+    (i64::MIN, i64::MIN, -1, false),
+    (1, i64::MIN + 1, 0, false),
+    (-16, -100, -1, false),
+    (i64::MAX, -63, 0, false),
+    (i64::MIN, -63, -1, false),
+    (16, -4, 1, false),
+    (7, 0, 7, false),
+    (0, 100, 0, false),
+    (0, 64, 0, false),
+    (0, i64::MAX, 0, false),
+    (1, 100, 0, true),
+    (-1, 64, 0, true),
+    (1, 62, 1 << 62, false),
+    (1, 63, i64::MIN, true),
+    (-1, 63, i64::MIN, false),
+    (3, 63, i64::MIN, true),
+    (0, 63, 0, false),
+    (i64::MAX, 1, -2, true),
+    (i64::MIN, 1, 0, true),
+    (-(1 << 62), 1, i64::MIN, false),
+    ((1 << 62) - 1, 1, i64::MAX - 1, false),
+    (1 << 62, 1, i64::MIN, true),
+];
+
+#[test]
+fn ash_edge_cases_evaluator() {
+    for &(n, k, want, want_flag) in ASH_CASES {
+        let (val, flag) = run_evaluator(&format!("(ash {n} {k})"));
+        assert_eq!(val, want.to_string(), "(ash {n} {k}) value");
+        assert_eq!(flag, want_flag, "(ash {n} {k}) OVERFLOW flag");
+    }
+}
+
+/// The compiled `ash` (constant shift in -63..=63) must agree with the
+/// evaluator on value and OVERFLOW flag for every compilable row (#514).
+#[test]
+fn ash_edge_cases_typed_parity() {
+    for &(n, k, want, want_flag) in ASH_CASES {
+        if !(-63..=63).contains(&k) {
+            continue;
+        }
+        let (val, flag) = run_typed(
+            &[&format!(
+                "(defun-typed (tash int64) ((x int64)) (ash x {k}))"
+            )],
+            &format!("(tash {n})"),
+        );
+        assert_eq!(val, want.to_string(), "typed (ash {n} {k}) value");
+        assert_eq!(flag, want_flag, "typed (ash {n} {k}) OVERFLOW flag");
+    }
+}

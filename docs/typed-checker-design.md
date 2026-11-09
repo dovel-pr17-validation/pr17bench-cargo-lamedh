@@ -1,0 +1,177 @@
+# Type-checked Lisp: a non-compiled checker on the HM engine
+
+Status: implemented (stages 1–5). Issue #162, part of the typed-JIT epic (#134).
+Builds on the inference engine (#135) and the compileable type lattice
+(#136/#137/#138).
+
+## 0. The thesis
+
+The typed JIT already runs Hindley–Milner-lite inference over function bodies
+(`src/jit/infer.rs`, `src/jit.rs`). Today it uses the result for exactly one
+thing: **lowering to unboxed native code.** A type that does not land in the
+*compileable* sub-lattice (`int64`/`float64`/`bool`/`char`/`(array T)`/struct) is
+rejected.
+
+But the inference is sound for far more than that. If we keep inferring past the
+compileable boundary — assigning *checkable-but-not-compileable* types to conses,
+symbols, strings, closures — we get a **type checker for ordinary Lisp for free**.
+The split that makes this work:
+
+> **Checkability ≠ compileability.** "Is this well-typed?" and "can this be
+> lowered to unboxed native code?" are the same inference pass with two different
+> acceptance criteria. Inference always runs and reports type errors;
+> *additionally*, when the inferred type falls in the compileable sub-lattice, we
+> emit native code.
+
+This catches a large class of software type errors (passing a cons where a number
+is expected, branch-type mismatches, arity errors) with no new engine — only a
+wider type language and a second `resolve` target.
+
+## 1. The boundary: Wand, fexpr, vau
+
+We cannot type the operative layer. Wand's triviality result: an operative
+(`$vau`, `defexpr`, anything that observes operand *syntax* or the caller
+*environment*) admits no useful type. Also outside: `eval`, `current-environment`,
+and **create-on-assign `setq`** (which mutates the lexical frame, defeating
+lexical typing).
+
+The checker handles this exactly as the compiler does — **gradually**. Inference
+flows over the applicative island and degrades to a top type `Any` the moment a
+value crosses an operative boundary. `Any` unifies with anything and propagates,
+so the checker stays *sound on the typed core* and simply makes no claim across
+the membrane. This is the same deopt boundary the codegen path already draws
+(`docs/typed-jit-design.md` §2–§3), reused for checking.
+
+Soundness contract: a value typed non-`Any` is guaranteed to have that type on
+the applicative island; `Any` is the honest "we don't know" that quarantines the
+operative world. (This is gradual typing's standard dynamic frontier; full
+blame-tracking is out of scope for the first cut.)
+
+## 2. The one real divergence: generalization vs monomorphization
+
+This is the load-bearing new piece, *not* the extra type variants.
+
+- The **compiler** wants **monomorphization**: `(defun id (x) x)` is rejected
+  because no single unboxed representation can be chosen — it is ambiguous *for
+  codegen*.
+- The **checker** wants **generalization**: `(defun id (x) x)` is `∀α. α → α` —
+  perfectly well-typed. To accept it, the checker must *generalize* a function's
+  inferred type at its definition (close over the free type variables) and
+  *instantiate* fresh copies at each call site (let-polymorphism / Algorithm W's
+  `gen`/`inst`).
+
+So the checker is strictly *more* HM than the compiler. The plan adds `gen`/`inst`
+to the inference layer; the compiler path keeps requiring a fully-ground
+monomorphic type (it just never generalizes, or instantiates-then-monomorphizes
+per call site).
+
+## 3. Type language
+
+Extend `Ty` with checkable-but-not-compileable variants (the engine's
+`unify`/`occurs`/`resolve` already recurse structurally, so they come along):
+
+```
+Compileable (today):  Int64 | Float64 | Bool | Char | Array(Ty) | Struct(def) | Var(u32)
+Checkable (new):       List(Ty)        ; homogeneous proper list
+                       Pair(Ty, Ty)    ; a cons cell (car, cdr)
+                       Symbol
+                       Str             ; the boxed LispVal::String (≠ (array char))
+                       Fn(Vec<Ty>, Ty) ; arrow type, for higher-order checking
+                       Any             ; the gradual top / operative frontier
+```
+
+Plus a type scheme `Scheme { vars: Vec<u32>, ty: Ty }` for generalized
+definitions.
+
+`is_compileable(&Ty) -> bool` partitions the lattice; codegen gates on it.
+
+## 4. Engine changes (`src/jit/infer.rs`)
+
+- `unify`: extend with the new structural cases (`List`/`Pair`/`Fn` recurse;
+  `Symbol`/`Str` are nullary; **`Any` unifies with everything, no binding** — it
+  is absorbing, the gradual rule).
+- `occurs`: recurse into `List`/`Pair`/`Fn`.
+- `resolve_checked(&Ty) -> Result<Ty>`: resolve to any concrete checkable type
+  (an unconstrained variable generalizes rather than erroring).
+- `resolve_compileable(&Ty) -> Result<Ty>`: today's strict resolve (the codegen
+  gate); errors on any non-compileable or unresolved type.
+- `generalize(&Ty) -> Scheme` and `instantiate(&Scheme) -> Ty`.
+
+## 5. Surface & integration
+
+- A pure **checking pass** that never compiles: `(check-type X)` — runs
+  inference, returns the inferred type (or scheme) as a printable type, or a type
+  error. No binding change, no codegen. Two argument shapes, auto-detected:
+  - **function name** — `(check-type f)` / `(check-type 'f)` reports the stored
+    or inferred signature of the function `f`.
+  - **arbitrary expression** — `(check-type 10)` → `"int64"`,
+    `(check-type (+ 10 1))` → `"int64"`, `(check-type (+ 10 1.0))` → a type
+    error, `(check-type (array 5))` → `"(forall (a) (array a))"`. The expression
+    is elaborated in checker mode; if it reduces to the gradual top type `any`
+    (e.g. it is itself a `(defun …)`), it is evaluated and the result re-checked,
+    so `(check-type (defun id (x) x))` reports the polymorphic identity type.
+- The elaborator (`Cx::elab`) learns the new literal/op shapes only as needed:
+  `cons`/`car`/`cdr`/`list`/`null`/symbol-literals map to `Pair`/`List`/`Symbol`;
+  everything it cannot place becomes `Any` (gradual) rather than an error.
+- `infer_untyped` already separates "typed" from "installed native"; it gains the
+  checked path so a function that *type-checks but isn't compileable* is reported
+  as checked (and left dynamic), while a compileable one additionally goes native.
+- Calls into untyped/operative bindings yield `Any` for their result and do not
+  constrain their arguments (the frontier).
+
+## 6. Staging
+
+1. **[done] Type language + engine** — checkable variants, `Any` (absorbing),
+   structural `unify`/`occurs`, `resolve_checked`/`is_compileable`. Unit-tested
+   in isolation.
+2. **[done] Generalization** — `Scheme`, `generalize`/`instantiate`/`zonk`,
+   let/defun polymorphism (`id : ∀a. a → a`).
+3. **[done] Checking surface** — `(check-type …)` reporting inferred types /
+   errors without compiling; `Jit::check_untyped`; gradual `Any` at the
+   fexpr/vau/`eval`/free-symbol frontier; checker-mode list/pair/symbol/string
+   forms.
+4. **[done] Wire to the codegen gate** — `Jit::analyze_untyped` runs the checker
+   then gates native codegen on compileability in one pass, returning
+   `Native` / `Checked` / `TypeError`. `jit-optimize` now reports this verdict
+   (e.g. `f : (-> (int64) int64)  [native]`, `… [checked, dynamic]`, or
+   `type error in f: …`), so a definition surfaces a type error even when it gets
+   no native edition.
+5. **[done] Branch/control-flow typing** — `cond`/`when`/`unless`; `if`, `and`,
+   `or`, `not` follow Lisp **truthiness** in checker mode (any condition/operand),
+   so ordinary recursive list code checks. (Still todo: `case`, more list/string
+   builtin signatures, `Any`-coercion blame, surface annotations for the
+   checkable types — tracked as follow-ups.)
+
+### Branch joins and literal `nil` (#336)
+
+A bare `nil`/`()` literal types as `(list _)` so that a nil branch meeting a
+genuine list branch still unifies as a list (`(if p (list 1 2) nil)` is
+`(list int64)`). But when a literal-nil `if` branch meets a branch that is
+**not** a list — a ground scalar, or a still-free variable — the join
+**degrades to `any`** instead of erroring or committing the other side to
+"list of something". This extends the declared layer's nil-on-miss honesty
+rule (lib/28-types.lisp rule 1: `parse-integer`, `nth`, `assoc`… get no
+result-type axiom) to the on-demand derived path (#308), so the standard
+guard idiom `(let ((n (parse-integer s))) (if (numberp n) n 10))` checks as
+`int64`. Two non-nil branches that disagree still error; nil-vs-list and
+nil-vs-`any` joins are unchanged. The same honesty applies to a
+self-recursive nil-on-miss helper: if a body's final type degrades to `any`
+but a recursive call already concretized the assumed return variable
+mid-elaboration, `check_callee` forces the assumption back to `any` before
+generalizing (the body's own join is authoritative). `cond` is deliberately
+NOT degraded this way — see the comment on `elab_cond` — a `cond` fix needs
+the recursion assumption itself to be nil-on-miss-aware (a 0.4 direction in
+the ticket).
+
+## Known limitation
+
+Lists are typed **homogeneous** (`(list α)`), like most typed languages.
+Genuinely heterogeneous list/quote data (e.g. `(list 1 "two")`) is reported as a
+type clash rather than accepted — the gradual `Any` escape is for the *operative*
+frontier (fexpr/vau/`eval`), not for heterogeneous data. This is why the checker
+is opt-in (`check-type` / `jit-optimize`) and not auto-run on every `defun`.
+
+Throughout: the checker is *additive* and *sound-on-the-island*; it never rejects
+a program the dynamic interpreter would have run (a checker error is a genuine
+type clash, and the operative frontier is always escapable to `Any`). Native
+codegen remains gated on `is_compileable`, unchanged in behavior.

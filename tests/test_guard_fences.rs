@@ -1,0 +1,830 @@
+//! Integration tests for lib/22-guard.lisp (issue #284): WITH-FUEL and
+//! WITH-CAPABILITIES — composable dynamic-extent attenuation of execution
+//! budget and capability authority, pure Lisp ("Phase 1").
+
+use lamedh::environment::Environment;
+use lamedh::{INTERPRETER_STACK_SIZE, Shared, eval_line, with_large_stack};
+use std::sync::mpsc;
+use std::time::Duration;
+
+fn env() -> Shared<Environment> {
+    Environment::with_stdlib()
+}
+
+// ---------------------------------------------------------------- fuel ----
+
+#[test]
+fn fuel_exhaustion_is_a_catchable_error_and_env_survives() {
+    with_large_stack(|| {
+        let e = env();
+        let out = eval_line(
+            "(handler-case
+               (with-fuel 50
+                 (defun guard-spin (n) (if (< n 1) 'done (guard-spin (- n 1))))
+                 (guard-spin 1000000))
+               (error (er) (error-message er)))",
+            &e,
+        );
+        assert!(
+            out.contains("fuel exhausted"),
+            "expected a fuel-exhausted error, got: {out}"
+        );
+        // The interpreter is healthy afterwards.
+        assert_eq!(eval_line("(+ 1 2)", &e), "3");
+    });
+}
+
+/// Run `f` on a large-stack interpreter thread and fail (rather than hang
+/// forever) if it does not finish within `timeout` — the guard a fuel-bypass
+/// regression test needs, since a reopened bypass hangs indefinitely instead
+/// of erroring.
+fn eval_line_with_timeout(src: &'static str, timeout: Duration) -> String {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(INTERPRETER_STACK_SIZE)
+        .spawn(move || {
+            let e = env();
+            let _ = tx.send(eval_line(src, &e));
+        })
+        .expect("failed to spawn interpreter thread");
+    rx.recv_timeout(timeout).unwrap_or_else(|_| {
+        panic!(
+            "timed out after {timeout:?} waiting for: {src}\n\
+             (a fuel bypass would hang here instead of erroring)"
+        )
+    })
+}
+
+// --------------------------------------------- issue #457: fuel bypass ----
+
+#[test]
+fn fuel_exhausted_inside_fence_cannot_be_caught_and_looped_past() {
+    // The issue's own reproduction: a HANDLER-CASE positioned INSIDE the very
+    // WITH-FUEL fence that exhausts, with a handler that never returns.
+    // Before the #457 fix, exhaustion unconditionally disarmed the counter
+    // (-1, unlimited) as it signalled, so the handler ran forever with
+    // unmetered fuel. Bounded by a hard wall-clock timeout: a reopened
+    // bypass hangs rather than erroring, so this must fail fast, not hang
+    // the suite.
+    let out = eval_line_with_timeout(
+        "(with-fuel 1000
+           (handler-case
+               (progn
+                 (defun issue457-spin (n) (issue457-spin (+ n 1)))
+                 (issue457-spin 0))
+             (error (er)
+               (defun issue457-handler-loop () (issue457-handler-loop))
+               (issue457-handler-loop))))",
+        Duration::from_secs(20),
+    );
+    assert!(
+        out.contains("fuel exhausted"),
+        "expected the owning WITH-FUEL frame to re-signal a catchable \
+         fuel-exhausted error to code outside the fence (the inside handler \
+         must never run), got: {out}"
+    );
+}
+
+#[test]
+fn fuel_grace_lets_unwind_protect_cleanup_run_but_stays_bounded() {
+    with_large_stack(|| {
+        let e = env();
+        eval_line("(def issue457b-cleanup-ran 'not-run)", &e);
+        // UNWIND-PROTECT's cleanup form is Rust-level control flow (it is
+        // not an ordinary guest HANDLER-CASE), so it is exactly what the
+        // grace allowance exists to fund: it must still run after the body
+        // exhausts fuel, evaluated under the fence's converted, ordinary
+        // catchable error.
+        let out = eval_line(
+            "(handler-case
+               (with-fuel 1000
+                 (unwind-protect
+                     (progn
+                       (defun issue457b-spin (n) (issue457b-spin (+ n 1)))
+                       (issue457b-spin 0))
+                   (setq issue457b-cleanup-ran 'ran)))
+               (error (er) 'caught))",
+            &e,
+        );
+        assert_eq!(
+            out, "CAUGHT",
+            "expected an ordinary catchable error outside the fence, got: {out}"
+        );
+        assert_eq!(
+            eval_line("issue457b-cleanup-ran", &e),
+            "RAN",
+            "the grace allowance must let UNWIND-PROTECT cleanup run after exhaustion"
+        );
+        // The interpreter is healthy afterwards.
+        assert_eq!(eval_line("(+ 1 2)", &e), "3");
+    });
+}
+
+#[test]
+fn fuel_grace_allowance_is_fixed_and_non_renewable() {
+    // A guest cannot defeat the grace allowance by putting an infinite loop
+    // in the cleanup form itself: grace is a small, fixed budget, not a
+    // second unconditional disarm. Bounded by a hard timeout — an unbounded
+    // grace would hang here instead of the fence eventually re-signalling.
+    let out = eval_line_with_timeout(
+        "(handler-case
+           (with-fuel 1000
+             (unwind-protect
+                 (progn
+                   (defun issue457c-spin (n) (issue457c-spin (+ n 1)))
+                   (issue457c-spin 0))
+               (defun issue457c-cleanup-spin (n) (issue457c-cleanup-spin (+ n 1)))
+               (issue457c-cleanup-spin 0)))
+           (error (er) 'caught))",
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        out, "CAUGHT",
+        "a looping cleanup form must not grant unlimited fuel either, got: {out}"
+    );
+}
+
+#[test]
+fn fuel_grace_does_not_leak_between_sibling_exhaustions() {
+    with_large_stack(|| {
+        let e = env();
+        // Two independent inner fences exhaust in turn inside one outer
+        // fence. Each must get its own fresh grace allowance (reset on
+        // (re)arm) rather than the first exhaustion's used-up grace state
+        // silently starving the second, and the outer fence must survive
+        // both.
+        let out = eval_line(
+            "(with-fuel 100000
+               (defun issue457d-spin1 (n) (issue457d-spin1 (+ n 1)))
+               (defun issue457d-spin2 (n) (issue457d-spin2 (+ n 1)))
+               (list
+                 (handler-case (with-fuel 50 (issue457d-spin1 0))
+                   (error (er) 'first-caught))
+                 (handler-case (with-fuel 50 (issue457d-spin2 0))
+                   (error (er) 'second-caught))
+                 (if (kernel-fuel-remaining) 'outer-alive 'outer-dead)))",
+            &e,
+        );
+        assert_eq!(out, "(FIRST-CAUGHT SECOND-CAUGHT OUTER-ALIVE)");
+    });
+}
+
+#[test]
+fn completed_fenced_work_matches_bare_result() {
+    with_large_stack(|| {
+        let e = env();
+        let fenced = eval_line(
+            "(with-fuel 100000 (mapcar (lambda (v) (* v v)) (list 1 2 3 4)))",
+            &e,
+        );
+        let bare = eval_line("(mapcar (lambda (v) (* v v)) (list 1 2 3 4))", &e);
+        assert_eq!(fenced, bare);
+        assert_eq!(fenced, "(1 4 9 16)");
+    });
+}
+
+#[test]
+fn tco_preserved_under_instrumentation() {
+    with_large_stack(|| {
+        let e = env();
+        // A million-iteration tail loop must complete inside a large budget —
+        // metering must not break tail position (~a few kernel steps per
+        // iteration).
+        let out = eval_line(
+            "(with-fuel 20000000
+               (defun guard-count (n acc) (if (< n 1) acc (guard-count (- n 1) (+ acc 1))))
+               (guard-count 1000000 0))",
+            &e,
+        );
+        assert_eq!(out, "1000000");
+    });
+}
+
+#[test]
+fn while_prog_dotimes_backedges_are_metered() {
+    with_large_stack(|| {
+        let e = env();
+        for (name, form) in [
+            ("while", "(with-fuel 40 (while t nil))"),
+            ("prog/go", "(with-fuel 40 (prog () lp (go lp)))"),
+            ("dotimes", "(with-fuel 40 (dotimes (i 1000000) nil))"),
+        ] {
+            let out = eval_line(&format!("(handler-case {form} (error (er) 'caught))"), &e);
+            assert_eq!(out, "CAUGHT", "{name} loop must exhaust, got: {out}");
+        }
+    });
+}
+
+#[test]
+fn fuel_remaining_introspection() {
+    with_large_stack(|| {
+        let e = env();
+        // Outside any fence: NIL.
+        assert_eq!(eval_line("(fuel-remaining)", &e), "()");
+        // One ruler (0.3): the budget is kernel steps, so even reading the
+        // gauge costs a few. Most of a 100-step budget must remain.
+        let left: i64 = eval_line("(with-fuel 100 (fuel-remaining))", &e)
+            .parse()
+            .expect("fuel-remaining should be a number");
+        assert!(left > 50 && left <= 100, "got {left}");
+    });
+}
+
+#[test]
+fn nested_fuel_clamps_and_charges_the_outer_fence() {
+    with_large_stack(|| {
+        let e = env();
+        // Inner request larger than the outer remainder is clamped to it
+        // (fence setup itself charges the enclosing budget — anything else
+        // would be a free-work escape).
+        let clamped: i64 = eval_line(
+            "(with-fuel 100000 (with-fuel 100000000 (fuel-remaining)))",
+            &e,
+        )
+        .parse()
+        .expect("fuel-remaining should be a number");
+        assert!(clamped > 50_000 && clamped < 100_000, "got {clamped}");
+        // Work inside the inner fence depletes the outer fence too.
+        let out = eval_line(
+            "(with-fuel 100000
+               (defun guard-n (n) (if (< n 1) 'd (guard-n (- n 1))))
+               (with-fuel 50000 (guard-n 100))
+               (fuel-remaining))",
+            &e,
+        );
+        let remaining: i64 = out.parse().expect("fuel-remaining should be a number");
+        assert!(
+            remaining < 99000,
+            "inner work must charge the outer fence, got remaining {remaining}"
+        );
+    });
+}
+
+#[test]
+fn eval_escape_hatch_is_metered() {
+    with_large_stack(|| {
+        let e = env();
+        let out = eval_line(
+            "(handler-case
+               (with-fuel 30 (eval (quote (prog () lp (go lp)))))
+               (error (er) 'caught))",
+            &e,
+        );
+        assert_eq!(out, "CAUGHT");
+    });
+}
+
+#[test]
+fn rebinding_the_chaining_name_does_not_evade_charging() {
+    with_large_stack(|| {
+        let e = env();
+        let out = eval_line(
+            "(handler-case
+               (with-fuel 50
+                 (setq $guard-tick (lambda () nil))
+                 (defun guard-e (n) (if (< n 1) 'evaded (guard-e (- n 1))))
+                 (guard-e 1000000))
+               (error (er) 'still-charged))",
+            &e,
+        );
+        assert_eq!(out, "STILL-CHARGED");
+    });
+}
+
+#[test]
+fn escaped_closures_run_against_a_retired_budget() {
+    with_large_stack(|| {
+        let e = env();
+        // A closure created under a fence and called after the fence exits
+        // must not raise stale fuel errors.
+        eval_line(
+            "(setq guard-escapee (with-fuel 10000 (lambda (v) (* v 2))))",
+            &e,
+        );
+        assert_eq!(eval_line("(funcall guard-escapee 21)", &e), "42");
+    });
+}
+
+#[test]
+fn no_compile_inside_fuel_fence() {
+    with_large_stack(|| {
+        let e = env();
+        assert_eq!(
+            eval_line(
+                "(with-fuel 1000 (defun guard-nc (x) (* x 2)) (jit-optimize guard-nc))",
+                &e
+            ),
+            "COMPILE-DISABLED-BY-GUARD"
+        );
+        let out = eval_line(
+            "(handler-case
+               (with-fuel 1000 (defun-typed (guard-t int64) ((x int64)) x))
+               (error (er) 'blocked))",
+            &e,
+        );
+        assert_eq!(out, "BLOCKED");
+    });
+}
+
+// ------------------------------- issue #502: defun-typed under fuel ----
+
+#[test]
+fn with_fuel_bounds_a_runaway_defun_typed_loop() {
+    // The issue's reproduction: a typed `while` loop that never terminates.
+    // Before #502 the call entered native code with no fuel check and hung;
+    // it must now stop with the ordinary catchable `fuel exhausted` error.
+    let out = eval_line_with_timeout(
+        "(progn
+           (defun-typed (issue502-inf int64) ((n int64))
+             (let ((s 0)) (while (> n 0) (setq s (+ s 1))) s))
+           (handler-case (with-fuel 1000 (issue502-inf 1))
+             (error (er) (error-message er))))",
+        Duration::from_secs(20),
+    );
+    assert!(
+        out.contains("fuel exhausted"),
+        "expected a fuel-exhausted error, got: {out}"
+    );
+}
+
+#[test]
+fn with_fuel_bounds_typed_for_loops_and_tail_recursion() {
+    let out = eval_line_with_timeout(
+        "(progn
+           (defun-typed (issue502-for int64) ((n int64))
+             (let ((s 0)) (for (i 0 n) (setq s (+ s 1))) s))
+           (defun-typed (issue502-tail int64) ((n int64)) (issue502-tail (+ n 1)))
+           (list
+             (handler-case (with-fuel 1000 (issue502-for 4000000000000))
+               (error (er) 'for-stopped))
+             (handler-case (with-fuel 1000 (issue502-tail 0))
+               (error (er) 'tail-stopped))))",
+        Duration::from_secs(20),
+    );
+    assert_eq!(out, "(FOR-STOPPED TAIL-STOPPED)");
+}
+
+#[test]
+fn typed_fuel_exhaustion_cannot_be_caught_inside_its_fence() {
+    // As for the tree-walker (#457): exhaustion inside typed code rides the
+    // control-flow signal, so a HANDLER-CASE inside the fence never sees it.
+    let out = eval_line_with_timeout(
+        "(progn
+           (defun-typed (issue502-inf2 int64) ((n int64))
+             (let ((s 0)) (while (> n 0) (setq s (+ s 1))) s))
+           (handler-case
+             (with-fuel 1000
+               (handler-case (issue502-inf2 1) (error (er) 'caught-inside)))
+             (error (er) (error-message er))))",
+        Duration::from_secs(20),
+    );
+    assert!(
+        out.contains("fuel exhausted"),
+        "the fence, not the inner handler, must receive exhaustion: {out}"
+    );
+}
+
+#[test]
+fn auto_typed_fuel_exhaustion_escapes_errorset_inside_its_fence() {
+    // The auto-typed (`defun*`) membrane must deliver exhaustion as the fence
+    // signal too: an ERRORSET inside the fence must not swallow it and let
+    // the guest carry on.
+    let out = eval_line_with_timeout(
+        "(progn
+           (defun* issue502-auto-inf ((n int64))
+             (let ((s 0)) (while (> n 0) (setq s (+ s 1))) s))
+           (handler-case
+             (with-fuel 1000
+               (errorset (issue502-auto-inf 1))
+               'escaped-fence)
+             (error (er) (error-message er))))",
+        Duration::from_secs(20),
+    );
+    assert!(
+        out.contains("fuel exhausted"),
+        "the fence, not ERRORSET, must receive exhaustion: {out}"
+    );
+}
+
+#[test]
+fn terminating_typed_calls_return_correct_values_under_fuel() {
+    with_large_stack(|| {
+        let e = env();
+        for def in [
+            "(defun-typed (issue502-sum int64) ((n int64))
+               (let ((s 0)) (while (> n 0) (setq s (+ s n)) (setq n (- n 1))) s))",
+            "(defun-typed (issue502-fib int64) ((n int64))
+               (if (< n 2) n (+ (issue502-fib (- n 1)) (issue502-fib (- n 2)))))",
+            "(defun-typed (issue502-acc int64) ((n int64) (acc int64))
+               (if (< n 1) acc (issue502-acc (- n 1) (+ acc n))))",
+            "(defun-typed (issue502-put int64) ((a (array int64)) (i int64) (v int64))
+               (store a i v))",
+        ] {
+            assert!(!eval_line(def, &e).starts_with("Error"), "{def}");
+        }
+        assert_eq!(
+            eval_line("(with-fuel 100000 (issue502-sum 100))", &e),
+            "5050"
+        );
+        assert_eq!(
+            eval_line("(with-fuel 1000000 (issue502-fib 15))", &e),
+            "610"
+        );
+        assert_eq!(
+            eval_line("(with-fuel 100000 (issue502-acc 100 0))", &e),
+            "5050"
+        );
+        // Array write-back still reaches the caller on the metered path.
+        assert_eq!(
+            eval_line(
+                "(let ((a (array 3))) (dotimes (i 3) (store a i 0)) (with-fuel 1000 (issue502-put a 1 7)) (aref a 1))",
+                &e
+            ),
+            "7"
+        );
+        // Unfenced calls are unaffected, and the fence left no budget armed.
+        assert_eq!(eval_line("(issue502-fib 15)", &e), "610");
+        assert_eq!(eval_line("(kernel-fuel-remaining)", &e), "()");
+    });
+}
+
+// -------------------------------------------------------- capabilities ----
+
+#[test]
+fn capabilities_attenuate_and_deny_with_a_catchable_error() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        e.enable_feature("CREATE-FS");
+        assert_eq!(
+            eval_line(
+                "(with-capabilities '(READ-FS) (capabilities-effective))",
+                &e
+            ),
+            "(READ-FS)"
+        );
+        let out = eval_line(
+            "(with-capabilities '(READ-FS)
+               (handler-case (write-file \"/tmp/guard-x\" \"hi\")
+                 (error (er) (error-message er))))",
+            &e,
+        );
+        assert!(
+            out.contains("capability denied") && out.contains("CREATE-FS"),
+            "expected a capability-denied error naming CREATE-FS, got: {out}"
+        );
+    });
+}
+
+#[test]
+fn capabilities_cannot_exceed_host_grants() {
+    with_large_stack(|| {
+        let e = env(); // nothing granted
+        assert_eq!(
+            eval_line(
+                "(with-capabilities '(READ-FS CREATE-FS SHELL) (capabilities-effective))",
+                &e
+            ),
+            "()"
+        );
+    });
+}
+
+#[test]
+fn nested_capabilities_intersect_and_narrowing_is_permanent() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        e.enable_feature("SHELL");
+        assert_eq!(
+            eval_line(
+                "(with-capabilities '(READ-FS SHELL)
+                   (with-capabilities '(SHELL CREATE-FS) (capabilities-effective)))",
+                &e
+            ),
+            "(SHELL)"
+        );
+        // Re-requesting a dropped capability inside does not restore it.
+        assert_eq!(
+            eval_line(
+                "(with-capabilities '(SHELL)
+                   (with-capabilities '(READ-FS SHELL) (capabilities-effective)))",
+                &e
+            ),
+            "(SHELL)"
+        );
+    });
+}
+
+#[test]
+fn allowed_operations_pass_through_the_fence() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        let out = eval_line(
+            "(with-capabilities '(READ-FS) (file-exists-p \"/etc/hostname\"))",
+            &e,
+        );
+        assert!(
+            out == "T" || out == "()",
+            "expected a normal boolean answer, got: {out}"
+        );
+    });
+}
+
+// --------------------------------------------------------- composition ----
+
+#[test]
+fn both_nesting_orders_behave_identically() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        let a = eval_line(
+            "(with-fuel 100000 (with-capabilities '()
+               (handler-case (read-file \"/etc/hostname\") (error (er) 'denied))))",
+            &e,
+        );
+        let b = eval_line(
+            "(with-capabilities '() (with-fuel 100000
+               (handler-case (read-file \"/etc/hostname\") (error (er) 'denied))))",
+            &e,
+        );
+        assert_eq!(a, "DENIED");
+        assert_eq!(b, "DENIED");
+    });
+}
+
+#[test]
+fn sandboxed_combinator_composes_both_fences() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        let out = eval_line(
+            "(sandboxed (:fuel 1000 :capabilities (READ-FS))
+               (list (fuel-remaining) (capabilities-effective)))",
+            &e,
+        );
+        // (steps-left (READ-FS)) with most of the 1000-step budget left.
+        assert!(out.ends_with("(READ-FS))"), "got: {out}");
+        let left: i64 = out
+            .trim_start_matches('(')
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("fuel number");
+        assert!(left > 500 && left <= 1000, "got: {out}");
+        let out = eval_line(
+            "(handler-case
+               (sandboxed (:fuel 40 :capabilities ()) (while t nil))
+               (error (er) 'caught))",
+            &e,
+        );
+        assert_eq!(out, "CAUGHT");
+    });
+}
+
+#[test]
+fn self_escalation_is_impossible_from_guarded_code() {
+    with_large_stack(|| {
+        let e = env();
+        // enable-feature is not exposed to Lisp at all; the sandbox contract
+        // (test_sandboxing.rs) holds inside fences too.
+        let out = eval_line(
+            "(handler-case
+               (with-capabilities '() (enable-feature \"SHELL\"))
+               (error (er) 'no-escalation))",
+            &e,
+        );
+        assert_eq!(out, "NO-ESCALATION");
+        assert!(!e.feature_enabled("SHELL"));
+    });
+}
+
+// ------------------------------------------------- capability manifests ----
+
+#[test]
+fn capabilities_needed_infers_transitively_and_cycle_safely() {
+    with_large_stack(|| {
+        let e = env();
+        eval_line("(defun cn-fetch (p) (read-file p))", &e);
+        eval_line(
+            "(defun cn-deploy (p q) (cn-fetch p) (rename-file p q) (shell:sh \"true\"))",
+            &e,
+        );
+        eval_line("(defun cn-pure (x) (* x x))", &e);
+        // Self-recursive caller: the walk must terminate.
+        eval_line(
+            "(defun cn-loop (n) (if (< n 1) (cn-deploy \"a\" \"b\") (cn-loop (- n 1))))",
+            &e,
+        );
+        assert_eq!(
+            eval_line("(capabilities-needed 'cn-fetch)", &e),
+            "(READ-FS)"
+        );
+        // Transitive closure incl. the Lisp-layer SH -> SHELL builtin edge,
+        // and RENAME-FILE's dual requirement (#273).
+        let deploy = eval_line("(capabilities-needed 'cn-deploy)", &e);
+        for cap in ["SHELL", "READ-FS", "CREATE-FS"] {
+            assert!(
+                deploy.contains(cap),
+                "deploy manifest missing {cap}: {deploy}"
+            );
+        }
+        assert_eq!(eval_line("(capabilities-needed 'cn-pure)", &e), "()");
+        assert_eq!(eval_line("(capabilities-needed 'cn-loop)", &e), deploy);
+    });
+}
+
+#[test]
+fn capabilities_needed_form_analyzes_raw_forms() {
+    with_large_stack(|| {
+        let e = env();
+        let out = eval_line(
+            "(capabilities-needed-form '(write-file \"x\" (shell:sh \"date\")))",
+            &e,
+        );
+        assert!(
+            out.contains("CREATE-FS") && out.contains("SHELL"),
+            "got: {out}"
+        );
+        assert_eq!(eval_line("(capabilities-needed-form '(+ 1 2))", &e), "()");
+    });
+}
+
+#[test]
+fn manifest_drives_a_minimal_fence_end_to_end() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        e.enable_feature("CREATE-FS");
+        // Infer the manifest, grant exactly that, and confirm an operation
+        // OUTSIDE the manifest is denied inside the fence.
+        eval_line("(defun mf-probe (p) (file-exists-p p))", &e);
+        let out = eval_line(
+            "(with-capabilities (capabilities-needed 'mf-probe)
+               (list (mf-probe \"/etc/hostname\")
+                     (handler-case (write-file \"/tmp/mf-x\" \"hi\")
+                       (error (er) 'denied))))",
+            &e,
+        );
+        assert!(out.ends_with("DENIED)"), "got: {out}");
+    });
+}
+
+// ------------------------------------------- kernel fuel backstop (#284) ----
+
+#[test]
+fn kernel_backstop_catches_pre_fence_closure_loops() {
+    with_large_stack(|| {
+        let e = env();
+        // The flagship Phase-1 leak: a function defined OUTSIDE the fence is
+        // not instrumented, so the Lisp-level ticks never fire — the kernel
+        // step budget must terminate it anyway, catchably.
+        eval_line(
+            "(defun kb-spin (n) (if (< n 1) 'leaked (kb-spin (- n 1))))",
+            &e,
+        );
+        let out = eval_line(
+            "(handler-case (with-fuel 50 (kb-spin 100000000))
+               (error (er) (error-message er)))",
+            &e,
+        );
+        assert!(
+            out.contains("fuel exhausted"),
+            "kernel backstop must catch the uninstrumented loop, got: {out}"
+        );
+        // The interpreter (and the disarmed counter) are healthy afterwards.
+        assert_eq!(eval_line("(+ 1 2)", &e), "3");
+        assert_eq!(eval_line("(kernel-fuel-remaining)", &e), "()");
+    });
+}
+
+#[test]
+fn kernel_backstop_arms_and_restores_around_fences() {
+    with_large_stack(|| {
+        let e = env();
+        // Unarmed outside any fence.
+        assert_eq!(eval_line("(kernel-fuel-remaining)", &e), "()");
+        // One ruler (0.3): armed at exactly the budget (minus the steps
+        // spent reaching the gauge).
+        let inside: i64 = eval_line("(with-fuel 100 (kernel-fuel-remaining))", &e)
+            .parse()
+            .expect("armed count");
+        assert!(
+            inside > 50 && inside <= 100,
+            "expected <=100 steps armed, got {inside}"
+        );
+        // Disarmed again after the fence exits.
+        assert_eq!(eval_line("(kernel-fuel-remaining)", &e), "()");
+    });
+}
+
+#[test]
+fn kernel_backstop_nested_exhaustion_leaves_outer_fence_alive() {
+    with_large_stack(|| {
+        let e = env();
+        eval_line(
+            "(defun kb-spin2 (n) (if (< n 1) 'leaked (kb-spin2 (- n 1))))",
+            &e,
+        );
+        let out = eval_line(
+            "(with-fuel 1000
+               (list (handler-case (with-fuel 50 (kb-spin2 100000000))
+                       (error (er) 'inner-caught))
+                     (if (kernel-fuel-remaining) 'outer-rearmed 'outer-disarmed)))",
+            &e,
+        );
+        // The inner fence exhausts and is caught; the outer fence re-arms
+        // with its remainder (1000 minus the inner spend of 50 and the
+        // handling overhead).
+        assert_eq!(out, "(INNER-CAUGHT OUTER-REARMED)");
+    });
+}
+
+#[test]
+fn kernel_fuel_setter_denied_inside_fence_usable_outside() {
+    with_large_stack(|| {
+        let e = env();
+        let out = eval_line(
+            "(handler-case (with-fuel 100 (kernel-fuel-set! nil))
+               (error (er) 'setter-denied))",
+            &e,
+        );
+        assert_eq!(out, "SETTER-DENIED");
+        // Host-level use outside any fence: arm, read, disarm.
+        assert_eq!(eval_line("(kernel-fuel-set! 5000)", &e), "()");
+        let rem: i64 = eval_line("(kernel-fuel-remaining)", &e)
+            .parse()
+            .expect("count");
+        assert!(rem > 4_000 && rem <= 5_000);
+        let prev: i64 = eval_line("(kernel-fuel-set! nil)", &e)
+            .parse()
+            .expect("previous count");
+        assert!(prev > 3_000 && prev < 5_000);
+        assert_eq!(eval_line("(kernel-fuel-remaining)", &e), "()");
+    });
+}
+
+// ── #320: dynamic-extent attenuation ─────────────────────────────────────
+
+#[test]
+fn attenuation_reaches_helpers_and_eval() {
+    with_large_stack(|| {
+        let e = env();
+        e.enable_feature("READ-FS");
+        eval_line(
+            "(defun guard-helper-reads () (read-file \"/etc/hostname\"))",
+            &e,
+        );
+        // The old lexical fence only shadowed names IN the body; the dynamic
+        // mask fences the whole extent — helpers and eval'd code included.
+        assert_eq!(
+            eval_line(
+                "(handler-case (with-capabilities '() (guard-helper-reads)) (error (er) 'denied))",
+                &e
+            ),
+            "DENIED"
+        );
+        assert_eq!(
+            eval_line(
+                "(handler-case (with-capabilities '() (eval '(read-file \"/etc/hostname\"))) (error (er) 'denied))",
+                &e
+            ),
+            "DENIED"
+        );
+        // Escaped closures run with the CALLER's authority (ambient authority
+        // belongs to the execution, not the definition site).
+        eval_line(
+            "(setq guard-esc (with-capabilities '() (lambda () (guard-helper-reads))))",
+            &e,
+        );
+        assert_eq!(eval_line("(stringp (funcall guard-esc))", &e), "T");
+    });
+}
+
+#[test]
+fn fuel_metering_reaches_helpers_and_natives_fall_back() {
+    with_large_stack(|| {
+        let e = env();
+        // A pre-compiled one-door native: under an armed fence it takes the
+        // interpreted fallback, so its internal work charges steps.
+        eval_line(
+            "(defun guard-native-spin (n acc) (if (< n 1) acc (guard-native-spin (- n 1) (+ acc 1))))",
+            &e,
+        );
+        assert_eq!(eval_line("(guard-native-spin 10 0)", &e), "10"); // warm/compile
+        let out = eval_line(
+            "(handler-case (with-fuel 50 (guard-native-spin 1000000 0)) (error (er) 'exhausted))",
+            &e,
+        );
+        assert_eq!(out, "EXHAUSTED");
+        // Widening from inside is denied; the fence restores on exit.
+        let out = eval_line(
+            "(handler-case (with-fuel 100 (kernel-fuel-set! 100000)) (error (er) 'widen-denied))",
+            &e,
+        );
+        assert_eq!(out, "WIDEN-DENIED");
+        assert_eq!(eval_line("(kernel-fuel-remaining)", &e), "()");
+    });
+}

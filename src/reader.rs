@@ -1,0 +1,1737 @@
+//! S-expression parser built with [nom](https://docs.rs/nom) combinator library.
+//!
+//! The public entry points are [`read`] (one form) and [`read_all`] (zero or
+//! more forms).  Both require an [`Environment`] reference so that symbol names
+//! can be interned into the global [`crate::environment::SymbolTable`] during
+//! parsing — this ensures that two occurrences of the same name share one `Rc`
+//! allocation and that `EQ` comparisons are pointer-equality tests.
+//!
+//! ## Syntax summary
+//!
+//! | Input | Parsed as |
+//! |-------|-----------|
+//! | `123`, `-456` | `LispVal::Number(i64)` |
+//! | `3.14`, `-1e5`, `1.5E-3` | `LispVal::Float(f64)` |
+//! | `177Q`, `177q` | Octal literal (`177₈ = 127₁₀`) — Lisp 1.5 notation |
+//! | `0FFh` | Hex literal (digit-leading, assembly-style `H` suffix) |
+//! | `'c'` | Character literal → `LispVal::Char` (byte 0–255; escapes `\n \t \r \\ \' \0`) |
+//! | `#\a`, `#\(`, `#\Space` | CL-style character literal → the same `LispVal::Char` (issue #526) |
+//! | `"hi\n"` | `LispVal::String` (supports `\n \t \r \\ \"`) |
+//! | `FOO`, `+`, `*x*`, `:key` | `LispVal::Symbol` (uppercased, interned) |
+//! | `(a b c)` | Proper list (cons chain ending in Nil) |
+//! | `(a . b)` | Dotted pair |
+//! | `'e` | `(QUOTE e)` |
+//! | `` `e `` | `(QUASIQUOTE e)` |
+//! | `,e` | `(UNQUOTE e)` |
+//! | `,@e` | `(UNQUOTE-SPLICING e)` |
+//! | `#'f` | `(FUNCTION f)` |
+//! | `#(a b c)` | `LispVal::Array` literal; elements unevaluated (issue #527) |
+//! | `#x1F`, `#b101`, `#o17` | Radix literals (hex, binary, octal) |
+//! | `; comment` | Ignored to end of line |
+//! | `#\| comment \|#` | Block comment (nests) |
+//! | `#!...` (first line) | Shebang line, ignored |
+//! | `#+feature form` | `form`, when `feature` is present; otherwise read and discarded, producing no value (issue #459) |
+//! | `#-feature form` | The complement of `#+` |
+//!
+//! Parse errors are reported with 1-based line/column positions (issue #238).
+//!
+//! A numeric literal must end at a delimiter (end of input, space, tab, CR,
+//! LF, `(`, `)`, `"`, `'`, `` ` ``, `,`, `;`). A token that starts like a
+//! number but is not a complete one (`123abc`, `1.5x`, `2.0.3`, `1-2`, `8Q`) is a parse
+//! error, never a number followed by a symbol; `1+` and `1-` alone are
+//! symbols. A Q/H/radix literal outside the i64 range is also a parse error
+//! (issue #503). An oversized decimal integer still reads as a float.
+//!
+//! ## Reader `#+`/`#-` conditionals (issue #459)
+//!
+//! `#+feature-expr form` reads `form` normally when `feature-expr` is
+//! satisfied by the reading [`Environment`]'s reader-feature set, and reads
+//! it as if it were whitespace otherwise: `form` is still parsed
+//! structurally (so unbalanced parens or malformed syntax inside a skipped
+//! form is still a parse error, and surrounding list/vector parsing is
+//! unaffected), but it contributes no value at the read site. `#-feature-expr
+//! form` is the exact complement. A `feature-expr` is an atomic symbol
+//! (case-folded and interned like any other symbol; a leading `:` is
+//! optional and ignored -- `#+rust` and `#+:rust` are equivalent) tested for
+//! membership in the environment's reader-feature set
+//! ([`Environment::reader_feature_enabled`]), or one of `(AND e...)`,
+//! `(OR e...)`, `(NOT e)` combining nested feature expressions, matching
+//! Common Lisp's own grammar closely enough that porting familiarity
+//! carries over. Conditionals nest and chain (`#+a #-b form` reads `form`
+//! when `a` is present and `b` is absent) and are resolved purely at read
+//! time -- there is no runtime trace of a skipped form.
+//!
+//! This is a **layered, optional** reader extension, not part of the
+//! grammar-minimal kernel surface (`KERNEL.md` Part II documents the
+//! reference's grammar for it; Part XII lists it as a declared axis a host
+//! may omit entirely, exactly like float literals or radix literals, as
+//! long as no `lib/*.lisp` file it loads relies on it). The reader-feature
+//! set itself -- which names exist, and whether more can be added -- is a
+//! per-host fact set by the embedding host at startup
+//! ([`Environment::enable_reader_feature`] /
+//! [`Environment::disable_reader_feature`]), deliberately kept separate
+//! from the sandbox capability grants `Environment::enable_feature` toggles
+//! (see that field's doc comment in `src/environment.rs` for why).
+//!
+//! Symbols are **always** uppercased during interning, so `foo`, `FOO`, and
+//! `Foo` all resolve to the same interned `Symbol` named `"FOO"`.
+
+use crate::LispVal;
+use crate::Shared;
+use crate::environment::Environment;
+use nom::{
+    IResult,
+    branch::alt,
+    bytes::complete::{is_not, tag, take_while, take_while1},
+    character::complete::{alpha1, alphanumeric1, char, digit1, hex_digit1, multispace1, one_of},
+    combinator::{cut, map, opt, recognize},
+    multi::many0,
+    sequence::{delimited, pair, preceded, tuple},
+};
+
+type ParseResult<'a> = IResult<&'a str, LispVal>;
+
+/// Default maximum nesting depth `parse_expr` will recurse through — bounds
+/// the parser's native call-stack usage so that pathological input like tens
+/// of thousands of nested `(` or a long `'''...` chain produces a parse error
+/// instead of a native stack overflow (issue #270).
+///
+/// Chosen empirically (see the issue #270 PR for the measurement methodology):
+/// on this platform, unbounded recursion on nested-paren input crashes an
+/// 8 MiB thread at a depth of about 1300-1320 in a debug build, i.e. roughly
+/// 6.4 KB of stack per nesting level. 512 therefore leaves ~2.5x headroom on
+/// any stack of 8 MiB or more (a typical main thread).
+///
+/// **What this default does and does not protect:** callers of the plain
+/// [`read`] / [`read_all`] / [`read_next`] entry points are protected as long
+/// as they run on a stack of at least ~4 MiB (512 levels x ~6.4 KB ≈ 3.3 MiB
+/// worst case). On *smaller* stacks — e.g. a 2 MiB spawned thread, whose
+/// capacity is only ~330 levels — this default is **not** low enough; such
+/// callers must use [`read_with_depth_limit`] (or the other `_with_depth_limit`
+/// variants) with a limit sized to their stack. Conversely, callers on the
+/// 512 MiB [`crate::with_large_stack`] thread (the CLI, `load_file`,
+/// `read-from-string`) can afford a far higher limit — the evaluator-facing
+/// entry points read it from
+/// [`crate::environment::Environment::reader_depth_limit`], which
+/// [`crate::environment::Environment::with_stdlib`] raises to 50,000
+/// (~320 MB worst case, still under the 512 MiB stack; the empirical crash
+/// boundary there is ~84,000-90,000 levels).
+pub const DEFAULT_READER_DEPTH: usize = 512;
+
+/// `nom::error::ErrorKind` used as a sentinel to distinguish the "nesting too
+/// deep" failure from ordinary parse errors so [`read_next_with_depth_limit`]
+/// can render a dedicated message. Not otherwise produced by this module.
+const TOO_DEEP_KIND: nom::error::ErrorKind = nom::error::ErrorKind::TooLarge;
+
+fn too_deep_error(input: &str) -> nom::Err<nom::error::Error<&str>> {
+    // A hard `Failure` (not `Error`): once the depth limit is hit we want to
+    // unwind immediately rather than have `alt`/`many0`/`opt` backtrack and
+    // retry other productions at the same (already too-deep) position.
+    nom::Err::Failure(nom::error::Error::new(input, TOO_DEEP_KIND))
+}
+
+/// `remaining` counts *down* from the caller-chosen depth limit: the top-level
+/// entry points pass the limit itself, each nesting production passes
+/// `remaining - 1`, and hitting zero raises the too-deep failure. Counting
+/// down (rather than up against a threaded limit) keeps the recursion to a
+/// single extra parameter.
+fn parse_expr(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        if remaining == 0 {
+            return Err(too_deep_error(input));
+        }
+        preceded(
+            skip_ws_and_conditionals(env.clone(), remaining),
+            alt((
+                parse_atom(env.clone()),
+                parse_string,
+                // #S(...) before plain lists so the dispatch never treats
+                // the payload list as a form.
+                parse_struct_literal(env.clone(), remaining),
+                parse_array_literal(env.clone(), remaining),
+                parse_list(env.clone(), remaining),
+                // Char literal 'c' before the quote reader macro: 'a' is a char,
+                // 'a (no closing quote) stays (quote a).
+                parse_char_literal,
+                parse_hash_char_literal,
+                parse_quoted(env.clone(), remaining),
+                parse_quasiquoted(env.clone(), remaining),
+                // ,@ before , : `,@e` is splicing, `,e` is plain unquote.
+                parse_unquote_spliced(env.clone(), remaining),
+                parse_unquoted(env.clone(), remaining),
+                parse_function_shorthand(env.clone(), remaining),
+            )),
+        )(input)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `#+`/`#-` reader conditionals (issue #459) -- see the module doc comment
+// above for the grammar and semantics.
+// ---------------------------------------------------------------------------
+
+/// Skip ordinary whitespace/comments (`ws`) plus any number of leading
+/// `#+`/`#-` conditionals, looping so that chained directives
+/// (`#+a #-b form`) and a directive immediately followed by another
+/// directive are both handled without recursing back through `parse_expr`'s
+/// top-level dispatch. A conditional that resolves to "skip" has its guarded
+/// form parsed (via `parse_expr`, so nested conditionals and every other
+/// production apply) and discarded right here -- read as if it were
+/// whitespace; one that resolves to "keep" only has its `#+`/`#-` prefix
+/// consumed, leaving the guarded form for the caller's own parse.
+///
+/// Used both as `parse_expr`'s whitespace-skipping prefix and directly by
+/// [`read_next_with_depth_limit`], so that a source text consisting only of
+/// whitespace and skipped conditionals reads as "no more forms" rather than
+/// an end-of-input parse error.
+fn skip_ws_and_conditionals(
+    env: Shared<Environment>,
+    remaining: usize,
+) -> impl Fn(&str) -> IResult<&str, ()> {
+    move |input: &str| {
+        let mut current = input;
+        loop {
+            let (rest, _) = ws(current)?;
+            match parse_conditional_directive(rest, &env, remaining) {
+                Ok((rest2, keep)) => {
+                    if keep {
+                        // The guarded form is read normally by the caller (or
+                        // the next loop iteration, for a chained directive)
+                        // rather than here -- but a directive still promises
+                        // a form must follow, exactly as the discard branch
+                        // below requires one. Failing to check that here
+                        // would make a bare `#+feature` at true end-of-input
+                        // silently mean "no more forms" when the feature is
+                        // present while the identical shape with an absent
+                        // feature (falling into the discard branch) errors --
+                        // an asymmetry with no principled reader-level
+                        // justification. So peek past whitespace/comments
+                        // without consuming, and fail the same way the
+                        // discard branch's `cut` would on a missing form.
+                        let (peek, _) = ws(rest2)?;
+                        if peek.is_empty() || peek.starts_with(')') {
+                            return Err(nom::Err::Failure(nom::error::Error::new(
+                                rest2,
+                                nom::error::ErrorKind::Eof,
+                            )));
+                        }
+                        current = rest2;
+                    } else {
+                        // Read the guarded form structurally, then discard it.
+                        // A discarded form is never read, so an oversized
+                        // decimal literal inside it must not leave `OVERFLOW`
+                        // set (issue #515).
+                        let had_overflow = env.flag_set("OVERFLOW");
+                        let skipped = preceded(
+                            ws,
+                            parse_expr(env.clone(), remaining.saturating_sub(1)),
+                        )(rest2);
+                        if !had_overflow {
+                            env.clear_flag("OVERFLOW");
+                        }
+                        current = skipped?.0;
+                    }
+                }
+                Err(nom::Err::Error(_)) => return Ok((rest, ())),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// Try to parse one `#+feature-expr` or `#-feature-expr` prefix (not the
+/// guarded form that follows it). Returns `Ok((rest, keep))` where `keep`
+/// says whether the form that follows should be read normally (`true`) or
+/// read-and-discarded (`false`). No `#+`/`#-` tag at `input` is an ordinary
+/// `Error` (so [`skip_ws_and_conditionals`] can treat this as "no more
+/// conditionals here" and stop looping); once the tag itself has matched,
+/// everything after it is committed with `cut` -- a malformed feature
+/// expression is a hard `Failure`, mirroring `parse_list`'s `cut` after `(`
+/// (there is no other `#+`/`#-`-shaped production to fall back to).
+fn parse_conditional_directive<'a>(
+    input: &'a str,
+    env: &Shared<Environment>,
+    remaining: usize,
+) -> IResult<&'a str, bool> {
+    let (rest, tag_str) = alt((tag("#+"), tag("#-")))(input)?;
+    let positive = tag_str == "#+";
+    let (rest, feature_val) = cut(preceded(
+        ws,
+        parse_expr(env.clone(), remaining.saturating_sub(1)),
+    ))(rest)?;
+    let truth = eval_feature_expr(env, &feature_val).map_err(|_| {
+        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+    })?;
+    Ok((rest, if positive { truth } else { !truth }))
+}
+
+/// Evaluate a parsed feature expression (an atomic symbol, or `(AND ...)`,
+/// `(OR ...)`, `(NOT e)` over feature expressions) against `env`'s reader-
+/// feature set. Symbol names are matched exactly as
+/// [`Environment::reader_feature_enabled`] does (case already folded by the
+/// reader; a leading `:` is stripped there).
+fn eval_feature_expr(env: &Shared<Environment>, expr: &LispVal) -> Result<bool, String> {
+    match expr {
+        LispVal::Symbol(sym) => Ok(env.reader_feature_enabled(&sym.borrow().name)),
+        LispVal::Cons { car, .. } => {
+            let LispVal::Symbol(op) = car.as_ref() else {
+                return Err("feature expression list must start with a symbol".to_string());
+            };
+            let op_name = op.borrow().name.to_uppercase();
+            let args = feature_expr_list_to_vec(expr)?;
+            let args = &args[1..];
+            match op_name.as_str() {
+                "AND" => {
+                    for a in args {
+                        if !eval_feature_expr(env, a)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                "OR" => {
+                    for a in args {
+                        if eval_feature_expr(env, a)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                "NOT" => match args {
+                    [only] => Ok(!eval_feature_expr(env, only)?),
+                    _ => Err("NOT takes exactly one feature expression".to_string()),
+                },
+                other => Err(format!("unknown feature expression operator {other}")),
+            }
+        }
+        _ => Err("feature expression must be a symbol or an (AND|OR|NOT ...) form".to_string()),
+    }
+}
+
+/// Walk a proper list `LispVal` into a `Vec` (erroring on a dotted or
+/// non-list tail), mirroring [`parse_struct_literal`]'s own list walk.
+fn feature_expr_list_to_vec(list: &LispVal) -> Result<Vec<LispVal>, String> {
+    let mut items = Vec::new();
+    let mut cur = list.clone();
+    loop {
+        match cur {
+            LispVal::Nil => return Ok(items),
+            LispVal::Cons { car, cdr } => {
+                items.push(car.as_ref().clone());
+                cur = cdr.as_ref().clone();
+            }
+            _ => return Err("feature expression list must be a proper list".to_string()),
+        }
+    }
+}
+
+// A parser for a comment
+fn parse_comment(input: &str) -> IResult<&str, &str> {
+    recognize(pair(tag(";"), opt(is_not("\n\r"))))(input)
+}
+
+// A parser for a (nesting) block comment: #| ... |# (issue #248).
+// An unterminated block comment is a hard Failure so the error position
+// points at its opening `#|`.
+fn parse_block_comment(input: &str) -> IResult<&str, &str> {
+    if !input.starts_with("#|") {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    let bytes = input.as_bytes();
+    let mut depth = 1usize;
+    let mut i = 2usize;
+    while i < bytes.len() {
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'|' && i + 1 < bytes.len() && bytes[i + 1] == b'#' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Ok((&input[i..], &input[..i]));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Err(nom::Err::Failure(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::TakeUntil,
+    )))
+}
+
+// A parser for whitespace, including line and block comments
+fn ws(input: &str) -> IResult<&str, &str> {
+    recognize(many0(alt((
+        multispace1,
+        parse_comment,
+        parse_block_comment,
+    ))))(input)
+}
+
+// End-of-token check shared by every number parser (issue #503). A numeric
+// literal is complete only when the next char is a delimiter (end of input,
+// `ws` whitespace, a paren, or the start of a string/quote/quasiquote/unquote/
+// comment). Anything else (`123abc`, `1.5x`, `2.0.3`, `1-2`) means the token
+// only STARTS like a number: the parser rejects it rather than half-consume
+// it, and since no symbol production accepts a leading digit, such a token
+// is a parse error -- never a number followed by a stray symbol.
+fn is_delimiter(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\r' | '\n' | '(' | ')' | '"' | '\'' | '`' | ',' | ';'
+    )
+}
+
+fn at_token_end(rest: &str) -> bool {
+    rest.chars().next().is_none_or(is_delimiter)
+}
+
+fn number_error(input: &str) -> nom::Err<nom::error::Error<&str>> {
+    nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
+}
+
+/// `nom::error::ErrorKind` used as a sentinel for a complete Q/H/radix
+/// literal whose value is not an i64 (overflow, or a non-octal digit in
+/// `8Q`), so [`read_next_with_depth_limit`] can render a dedicated message.
+/// Not otherwise produced by this module.
+const BAD_NUMBER_KIND: nom::error::ErrorKind = nom::error::ErrorKind::MapRes;
+
+// A hard Failure: falling through would let another number parser re-read
+// the same digits in a different base (issue #503).
+fn number_overflow(input: &str) -> nom::Err<nom::error::Error<&str>> {
+    nom::Err::Failure(nom::error::Error::new(input, BAD_NUMBER_KIND))
+}
+
+fn parse_float(input: &str) -> ParseResult<'_> {
+    // `1.5`, `1.5e3`, and exponent-only `1e5` / `-2E-3`.
+    let exponent = || recognize(tuple((one_of("Ee"), opt(one_of("+-")), digit1)));
+    let (rest, s) = recognize(tuple((
+        opt(tag("-")),
+        digit1,
+        alt((
+            recognize(tuple((tag("."), digit1, opt(exponent())))),
+            exponent(),
+        )),
+    )))(input)?;
+    if !at_token_end(rest) {
+        return Err(number_error(input));
+    }
+    match s.parse::<f64>() {
+        Ok(f) => Ok((rest, LispVal::Float(f))),
+        Err(_) => Err(number_error(input)),
+    }
+}
+
+fn parse_octal_integer(input: &str) -> ParseResult<'_> {
+    // Lisp 1.5: digits followed by Q means octal, e.g. 177Q = 127. The suffix
+    // is case-insensitive, like hex's H.
+    let (rest, s) = recognize(pair(opt(tag("-")), digit1))(input)?;
+    let (rest, _) = one_of("qQ")(rest)?;
+    if !at_token_end(rest) {
+        return Err(number_error(input));
+    }
+    // Parse with the sign attached so i64::MIN is representable. A failure
+    // here is an overflow or a non-octal digit (`8Q`): either way the token
+    // is a complete, malformed octal literal.
+    match i64::from_str_radix(s, 8) {
+        Ok(n) => Ok((rest, LispVal::Number(n))),
+        Err(_) => Err(number_overflow(input)),
+    }
+}
+
+fn parse_hex_integer(input: &str) -> ParseResult<'_> {
+    // Assembly-style hex: hex digits followed by H, e.g. 0FFh = 255, 0Ah = 10,
+    // 1Ah = 26. Mirrors the Lisp 1.5 octal `Q` suffix. Case-insensitive in
+    // both the digits and the marker. REGULARITY (0.3): the literal must
+    // START WITH A DECIMAL DIGIT (the assembly convention) — so short
+    // letters-then-h names like `ch`, `each`, `fh` are ordinary symbols.
+    // Write 0FFh (or #xFF) where you meant FFh.
+    let (rest, s) = recognize(pair(opt(tag("-")), hex_digit1))(input)?;
+    let digits_start = s.trim_start_matches('-');
+    if !digits_start.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(number_error(input));
+    }
+    let (rest, _) = one_of("hH")(rest)?;
+    if !at_token_end(rest) {
+        return Err(number_error(input));
+    }
+    // Sign attached, so -8000000000000000H is i64::MIN.
+    match i64::from_str_radix(s, 16) {
+        Ok(n) => Ok((rest, LispVal::Number(n))),
+        Err(_) => Err(number_overflow(input)),
+    }
+}
+
+fn parse_integer_or_overflow_float(input: &str) -> ParseResult<'_> {
+    let (rest, s) = recognize(pair(opt(tag("-")), digit1))(input)?;
+    if !at_token_end(rest) {
+        return Err(number_error(input));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        Ok((rest, LispVal::Number(n)))
+    } else if let Ok(f) = s.parse::<f64>() {
+        Ok((rest, LispVal::Float(f)))
+    } else {
+        Err(number_error(input))
+    }
+}
+
+// CL-style radix literals: #x1F / #X1f (hex), #b101 (binary), #o17 (octal),
+// with an optional sign after the marker (issue #248).
+fn parse_radix_literal(input: &str) -> ParseResult<'_> {
+    let (rest, _) = tag("#")(input)?;
+    let (rest, marker) = one_of("xXbBoO")(rest)?;
+    let radix = match marker {
+        'x' | 'X' => 16,
+        'b' | 'B' => 2,
+        _ => 8,
+    };
+    let (rest, neg) = opt(tag("-"))(rest)?;
+    let (rest, digits) = take_while1(|c: char| c.is_digit(radix))(rest)?;
+    // Boundary guard: a trailing constituent means this was malformed
+    // (e.g. #b102 or #xFG) — fail rather than half-consume.
+    if !at_token_end(rest) {
+        return Err(number_error(input));
+    }
+    // Sign attached, so #x-8000000000000000 is i64::MIN.
+    let signed = if neg.is_some() {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    };
+    match i64::from_str_radix(&signed, radix) {
+        Ok(n) => Ok((rest, LispVal::Number(n))),
+        Err(_) => Err(number_overflow(input)),
+    }
+}
+
+fn parse_number(input: &str) -> ParseResult<'_> {
+    alt((
+        parse_float,
+        parse_radix_literal,
+        parse_hex_integer,
+        parse_octal_integer,
+        parse_integer_or_overflow_float,
+    ))(input)
+}
+
+/// [`parse_number`], plus the issue #515 side effect: a decimal integer token
+/// that did not fit `i64` reads as a float (KERNEL.md Part II) and loses
+/// precision, so set the global `OVERFLOW` flag like overflowing arithmetic.
+/// An explicit float (`.`/exponent) is exactly what was written and sets
+/// nothing.
+fn parse_number_flagging(env: Shared<Environment>) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        let (rest, val) = parse_number(input)?;
+        if matches!(val, LispVal::Float(_)) {
+            let token = &input[..input.len() - rest.len()];
+            if token.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
+                env.set_flag("OVERFLOW");
+            }
+        }
+        Ok((rest, val))
+    }
+}
+
+/// Character literal: `'c'` denotes the character `c`, read as its integer code
+/// point (a `LispVal::Number`). lamedh has no char value type, so a character is
+/// its code point — the same number `char-code` yields and `code-char` consumes,
+/// and the byte the typed-JIT `char` carries (issue #136).
+///
+/// One character between single quotes, with C-style escapes `\n \t \r \\ \' \0`.
+/// This is tried before the quote reader macro: `'a'` is the char a, while `'a`
+/// (no closing quote) remains `(quote a)`. Use `'\''` for the quote character.
+fn parse_char_literal(input: &str) -> ParseResult<'_> {
+    let err = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Char));
+    let (rest, _) = tag("'")(input)?;
+    let mut it = rest.char_indices();
+    let (_, c0) = it.next().ok_or_else(err)?;
+    let (code, consumed) = if c0 == '\\' {
+        let (_, c1) = it.next().ok_or_else(err)?;
+        let decoded = match c1 {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '\\' => '\\',
+            '\'' => '\'',
+            '0' => '\0',
+            other => other,
+        };
+        (decoded as i64, 1 + c1.len_utf8())
+    } else if c0 == '\'' {
+        // An empty '' is not a character literal; let other parsers try.
+        return Err(err());
+    } else {
+        (c0 as i64, c0.len_utf8())
+    };
+    let (rest2, _) = tag("'")(&rest[consumed..])?;
+    if code > 255 {
+        return Err(err());
+    }
+    Ok((rest2, LispVal::Char(code as u8)))
+}
+
+/// Named characters accepted after `#\\` (matched case-insensitively), per
+/// the Common Lisp standard and semi-standard names.
+const CHAR_NAMES: &[(&str, u8)] = &[
+    ("SPACE", b' '),
+    ("NEWLINE", b'\n'),
+    ("LINEFEED", b'\n'),
+    ("TAB", b'\t'),
+    ("RETURN", b'\r'),
+    ("PAGE", 12),
+    ("BACKSPACE", 8),
+    ("ESCAPE", 27),
+    ("RUBOUT", 127),
+    ("NUL", 0),
+    ("NULL", 0),
+];
+
+/// Common Lisp character syntax (issue #526): `#\a` reads as the same
+/// `LispVal::Char` that `'a'` does. It is a second spelling of the one char
+/// value, not a new type, so `(eq #\a 'a')` holds.
+///
+/// After `#\` comes either a single character of any kind (`#\(`, `#\;`,
+/// `#\"`, `#\ `), or, when that character is alphanumeric and more
+/// alphanumerics follow, a character NAME from [`CHAR_NAMES`] (`#\Space`,
+/// `#\newline`). An alphanumeric run that is not a known name (`#\ab`) is an
+/// error rather than a character followed by a symbol. As with `'c'`, the
+/// code point must fit in a byte.
+fn parse_hash_char_literal(input: &str) -> ParseResult<'_> {
+    let err = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Char));
+    let (rest, _) = tag("#\\")(input)?;
+    let c0 = rest.chars().next().ok_or_else(err)?;
+    let token_len = if c0.is_alphanumeric() {
+        rest.find(|c: char| !c.is_alphanumeric())
+            .unwrap_or(rest.len())
+    } else {
+        c0.len_utf8()
+    };
+    let token = &rest[..token_len];
+    let code = if token.len() == c0.len_utf8() {
+        u8::try_from(c0 as u32).map_err(|_| err())?
+    } else {
+        CHAR_NAMES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(token))
+            .map(|&(_, code)| code)
+            .ok_or_else(err)?
+    };
+    Ok((&rest[token_len..], LispVal::Char(code)))
+}
+
+fn parse_one_plus_minus(env: Shared<Environment>) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        let (rest, sym) = alt((tag("1+"), tag("1-")))(input)?;
+        // `1-2` is not `1-` followed by `2` (issue #503).
+        if !at_token_end(rest) {
+            return Err(number_error(input));
+        }
+        Ok((rest, LispVal::Symbol(env.intern_symbol(sym))))
+    }
+}
+
+fn parse_keyword_symbol(env: Shared<Environment>) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        map(
+            recognize(pair(
+                tag(":"),
+                pair(
+                    alt((alpha1, tag("&"), tag("$"))),
+                    many0(alt((
+                        alphanumeric1,
+                        tag("-"),
+                        tag("*"),
+                        tag("?"),
+                        tag("!"),
+                        tag("+"),
+                        tag("="),
+                        tag("<"),
+                        tag(">"),
+                        // `_` as a constituent supports the `?_` match
+                        // wildcard (lib/23-match.lisp); previously a parse
+                        // error here, so no existing program changes meaning.
+                        tag("_"),
+                    ))),
+                ),
+            )),
+            |s: &str| LispVal::Symbol(env.intern_symbol(&s.to_uppercase())),
+        )(input)
+    }
+}
+
+fn is_operator_char(c: char) -> bool {
+    matches!(c, '+' | '-' | '*' | '/' | '=' | '<' | '>' | '!' | '~')
+}
+
+fn parse_atom(env: Shared<Environment>) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        alt((
+            // Parse special numeric symbols like 1+ and 1- BEFORE numbers
+            parse_one_plus_minus(env.clone()),
+            parse_number_flagging(env.clone()),
+            // Parse earmuff symbols (*name*) - dynamic variable naming convention
+            // Must come before regular symbols and operators
+            parse_earmuff_symbol(env.clone()),
+            // Parse plus-earmuff symbols (+name+) - CL-style constant naming
+            // convention (e.g. `+NUMERIC-PRECISION-MODEL+`, `+HOST-TRAITS+`,
+            // KERNEL.md Part XII / issue #463). Must come before `parse_number`
+            // would otherwise be a non-issue (no leading digit means
+            // `parse_number` already fails on `+NAME+`), but must come before
+            // the final operator-symbol fallback below, which would otherwise
+            // greedily consume only the leading `+` and strand the rest of the
+            // token as a separate, wrongly-trailing-`+` symbol.
+            parse_plus_earmuff_symbol(env.clone()),
+            parse_keyword_symbol(env.clone()),
+            map(
+                recognize(pair(
+                    // `?` as a symbol-start supports pattern variables (`?x`,
+                    // `??xs` — lib/23-match.lisp). Previously a parse error in
+                    // this position, so no existing program changes meaning.
+                    alt((alpha1, tag("&"), tag("$"), tag("?"))),
+                    many0(alt((
+                        alphanumeric1,
+                        tag("-"),
+                        tag("*"),
+                        tag("?"),
+                        tag("!"),
+                        tag("+"),
+                        tag("="),
+                        tag("<"),
+                        tag(">"),
+                        // `:` as a NON-INITIAL constituent supports module-
+                        // qualified names, MODULE:SYMBOL (0.3 modules).
+                        // Keywords (leading `:`) parse before plain symbols
+                        // and are unaffected.
+                        tag(":"),
+                        // `_` as a constituent supports the `?_` match
+                        // wildcard (lib/23-match.lisp); previously a parse
+                        // error here, so no existing program changes meaning.
+                        tag("_"),
+                    ))),
+                )),
+                |s: &str| {
+                    let s_upper = s.to_uppercase();
+                    match s_upper.as_str() {
+                        "T" => LispVal::Symbol(env.intern_symbol("T")),
+                        "NIL" => LispVal::Nil,
+                        _ => LispVal::Symbol(env.intern_symbol(&s_upper)),
+                    }
+                },
+            ),
+            // Parse operator symbol sequences (>=, !=, /=, +, -, etc.)
+            map(take_while1(is_operator_char), |s: &str| {
+                LispVal::Symbol(env.intern_symbol(s))
+            }),
+        ))(input)
+    }
+}
+
+/// Parse earmuff symbols: *name* (dynamic variable naming convention)
+/// Examples: *debug*, *print-level*, *foo123*
+fn parse_earmuff_symbol(env: Shared<Environment>) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        map(
+            recognize(tuple((
+                tag("*"),
+                alpha1,
+                many0(alt((alphanumeric1, tag("-")))),
+                tag("*"),
+            ))),
+            |s: &str| LispVal::Symbol(env.intern_symbol(&s.to_uppercase())),
+        )(input)
+    }
+}
+
+/// Parse plus-earmuff symbols: +name+ (Common-Lisp-style constant naming
+/// convention). Examples: +numeric-precision-model+, +host-traits+.
+/// Mirrors [`parse_earmuff_symbol`]'s asterisk-earmuff grammar exactly,
+/// with `+` in place of `*`.
+fn parse_plus_earmuff_symbol(env: Shared<Environment>) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        map(
+            recognize(tuple((
+                tag("+"),
+                alpha1,
+                many0(alt((alphanumeric1, tag("-")))),
+                tag("+"),
+            ))),
+            |s: &str| LispVal::Symbol(env.intern_symbol(&s.to_uppercase())),
+        )(input)
+    }
+}
+
+fn parse_string(input: &str) -> ParseResult<'_> {
+    let (input, _) = char('"')(input)?;
+    let mut result = String::new();
+    let mut remaining = input;
+    loop {
+        let (rest, literal) = take_while(|c| c != '"' && c != '\\')(remaining)?;
+        result.push_str(literal);
+        remaining = rest;
+        if remaining.starts_with('\\') {
+            let after_backslash = &remaining[1..];
+            if after_backslash.is_empty() {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    remaining,
+                    nom::error::ErrorKind::Char,
+                )));
+            }
+            let c = after_backslash.chars().next().unwrap();
+            remaining = &after_backslash[c.len_utf8()..];
+            match c {
+                'n' => result.push('\n'),
+                't' => result.push('\t'),
+                'r' => result.push('\r'),
+                '\\' => result.push('\\'),
+                '"' => result.push('"'),
+                '0' => result.push('\0'),
+                _ => {
+                    result.push('\\');
+                    result.push(c);
+                }
+            }
+        } else if remaining.starts_with('"') {
+            remaining = &remaining[1..];
+            break;
+        } else {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Char,
+            )));
+        }
+    }
+    Ok((remaining, LispVal::String(result)))
+}
+
+fn parse_list_contents(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        // Skip whitespace and discarded `#+`/`#-` forms before each element, so
+        // a discarded conditional as the last element does not get
+        // backtracked over by `many0` and leave the closing `)` unreachable.
+        let skip = skip_ws_and_conditionals(env.clone(), remaining);
+        let elem = parse_expr(env.clone(), remaining);
+        let mut exprs = Vec::new();
+        let mut input = input;
+        loop {
+            let (rest, _) = skip(input)?;
+            match elem(rest) {
+                Ok((after, e)) => {
+                    exprs.push(e);
+                    input = after;
+                }
+                Err(nom::Err::Error(_)) => {
+                    input = rest;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let (input, tail) = opt(preceded(
+            preceded(ws, char('.')),
+            preceded(ws, parse_expr(env.clone(), remaining)),
+        ))(input)?;
+        if tail.is_some() && exprs.is_empty() {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Char,
+            )));
+        }
+
+        let end = tail.unwrap_or(LispVal::Nil);
+        Ok((
+            input,
+            exprs.into_iter().rev().fold(end, |cdr, car| LispVal::Cons {
+                car: Shared::new(car),
+                cdr: Shared::new(cdr),
+            }),
+        ))
+    }
+}
+
+fn parse_list(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        // `cut` after the opening paren: once `(` is consumed no other parser
+        // can apply, so a missing `)` becomes a hard Failure whose position
+        // points at the offending spot instead of backtracking to the form
+        // start (issue #238).
+        delimited(
+            char('('),
+            parse_list_contents(env.clone(), remaining - 1),
+            preceded(ws, cut(char(')'))),
+        )(input)
+    }
+}
+
+// Readable record literal (issue #308 stage D): `#S(BRAND v1 ... vn)` reads
+// as a native record value (`LispVal::Struct`) with the printed field values
+// in declaration order -- the exact inverse of the printer, so records
+// round-trip through print/read (spawn and channel serialization). The
+// reader is purely structural: it does not consult the record registry, so
+// a literal for a not-yet-declared brand still reads (like any symbol).
+fn parse_struct_literal(
+    env: Shared<Environment>,
+    remaining: usize,
+) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        let (rest, _) = alt((tag("#S"), tag("#s")))(input)?;
+        // The literal costs one level and `parse_list` another, so fewer than
+        // two remaining would underflow: report the depth limit instead.
+        if remaining < 2 {
+            return Err(too_deep_error(input));
+        }
+        let (rest, body) = parse_list(env.clone(), remaining - 1)(rest)?;
+        let err = || nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag));
+        let LispVal::Cons {
+            car: head,
+            cdr: mut cur,
+        } = body
+        else {
+            return Err(err());
+        };
+        let LispVal::Symbol(brand) = head.as_ref() else {
+            return Err(err());
+        };
+        let mut fields = Vec::new();
+        loop {
+            match cur.as_ref() {
+                LispVal::Nil => break,
+                LispVal::Cons { car, cdr } => {
+                    fields.push(car.as_ref().clone());
+                    cur = cdr.clone();
+                }
+                // A dotted tail is not a field list.
+                _ => return Err(err()),
+            }
+        }
+        Ok((
+            rest,
+            LispVal::Struct(std::rc::Rc::new(crate::StructObj {
+                type_name: brand.borrow().name.clone(),
+                fields,
+            })),
+        ))
+    }
+}
+
+// Readable array literal (issue #527): `#(e1 ... en)` reads as a fresh
+// `LispVal::Array` of the elements, unevaluated -- the inverse of the
+// printer's array form. Like `#S`, the literal is built once at read time,
+// so a quoted or self-evaluating literal in a function body is one shared
+// array across calls. A dotted tail is rejected.
+fn parse_array_literal(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    move |input: &str| {
+        let (rest, _) = tag("#")(input)?;
+        // `parse_list` itself counts the nesting level, so pass `remaining`
+        // unchanged (`remaining - 1` would underflow at the limit).
+        let (rest, body) = parse_list(env.clone(), remaining)(rest)?;
+        let mut elems = Vec::new();
+        let mut cur = &body;
+        loop {
+            match cur {
+                LispVal::Nil => break,
+                LispVal::Cons { car, cdr } => {
+                    elems.push(car.as_ref().clone());
+                    cur = cdr.as_ref();
+                }
+                _ => {
+                    return Err(nom::Err::Failure(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Tag,
+                    )));
+                }
+            }
+        }
+        Ok((
+            rest,
+            LispVal::Array(Shared::new(crate::SharedCell::new(elems))),
+        ))
+    }
+}
+
+fn parse_quoted(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    let quote_symbol = LispVal::Symbol(env.intern_symbol("QUOTE"));
+    move |input: &str| {
+        map(
+            preceded(char('\''), parse_expr(env.clone(), remaining - 1)),
+            |expr| LispVal::Cons {
+                car: Shared::new(quote_symbol.clone()),
+                cdr: Shared::new(LispVal::Cons {
+                    car: Shared::new(expr),
+                    cdr: Shared::new(LispVal::Nil),
+                }),
+            },
+        )(input)
+    }
+}
+
+fn parse_quasiquoted(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    let quasiquote_symbol = LispVal::Symbol(env.intern_symbol("QUASIQUOTE"));
+    move |input: &str| {
+        map(
+            preceded(char('`'), parse_expr(env.clone(), remaining - 1)),
+            |expr| LispVal::Cons {
+                car: Shared::new(quasiquote_symbol.clone()),
+                cdr: Shared::new(LispVal::Cons {
+                    car: Shared::new(expr),
+                    cdr: Shared::new(LispVal::Nil),
+                }),
+            },
+        )(input)
+    }
+}
+
+fn parse_function_shorthand(
+    env: Shared<Environment>,
+    remaining: usize,
+) -> impl Fn(&str) -> ParseResult {
+    let function_symbol = LispVal::Symbol(env.intern_symbol("FUNCTION"));
+    move |input: &str| {
+        map(
+            preceded(tag("#'"), parse_expr(env.clone(), remaining - 1)),
+            |expr| LispVal::Cons {
+                car: Shared::new(function_symbol.clone()),
+                cdr: Shared::new(LispVal::Cons {
+                    car: Shared::new(expr),
+                    cdr: Shared::new(LispVal::Nil),
+                }),
+            },
+        )(input)
+    }
+}
+
+fn parse_unquoted(env: Shared<Environment>, remaining: usize) -> impl Fn(&str) -> ParseResult {
+    let unquote_symbol = LispVal::Symbol(env.intern_symbol("UNQUOTE"));
+    move |input: &str| {
+        map(
+            preceded(char(','), parse_expr(env.clone(), remaining - 1)),
+            |expr| LispVal::Cons {
+                car: Shared::new(unquote_symbol.clone()),
+                cdr: Shared::new(LispVal::Cons {
+                    car: Shared::new(expr),
+                    cdr: Shared::new(LispVal::Nil),
+                }),
+            },
+        )(input)
+    }
+}
+
+fn parse_unquote_spliced(
+    env: Shared<Environment>,
+    remaining: usize,
+) -> impl Fn(&str) -> ParseResult {
+    let splice_symbol = LispVal::Symbol(env.intern_symbol("UNQUOTE-SPLICING"));
+    move |input: &str| {
+        map(
+            preceded(tag(",@"), parse_expr(env.clone(), remaining - 1)),
+            |expr| LispVal::Cons {
+                car: Shared::new(splice_symbol.clone()),
+                cdr: Shared::new(LispVal::Cons {
+                    car: Shared::new(expr),
+                    cdr: Shared::new(LispVal::Nil),
+                }),
+            },
+        )(input)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Positions, error rendering, and the incremental read API (issue #238)
+// ---------------------------------------------------------------------------
+
+/// Compute the 1-based (line, column) of byte `offset` within `src`.
+pub fn position_of(src: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(src.len());
+    let prefix = &src[..clamped];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = prefix
+        .rsplit('\n')
+        .next()
+        .map(|l| l.chars().count())
+        .unwrap_or(0)
+        + 1;
+    (line, col)
+}
+
+/// Render a parse error message with line/column context.
+pub fn format_parse_error(src: &str, offset: usize, detail: &str) -> String {
+    let (line, col) = position_of(src, offset);
+    format!("parse error at line {line}, column {col}: {detail}")
+}
+
+/// Describe the unparseable text starting at `rest` (one truncated line).
+fn error_detail(rest: &str) -> String {
+    if rest.trim().is_empty() {
+        "unexpected end of input (unclosed '(' or unterminated string?)".to_string()
+    } else {
+        let line = rest.lines().next().unwrap_or(rest);
+        let snippet: String = line.chars().take(40).collect();
+        format!("unexpected input near '{snippet}'")
+    }
+}
+
+/// Skip leading whitespace and comments (line and block).
+pub fn skip_ws(input: &str) -> &str {
+    match ws(input) {
+        Ok((rest, _)) => rest,
+        Err(_) => input,
+    }
+}
+
+/// Drop a leading `#!` shebang line so `.lisp` files can be executable
+/// scripts (issue #248).
+pub fn strip_shebang(input: &str) -> &str {
+    if input.starts_with("#!") {
+        // Keep the trailing newline so line numbers in later errors are
+        // unaffected by the stripped shebang.
+        match input.find('\n') {
+            Some(i) => &input[i..],
+            None => "",
+        }
+    } else {
+        input
+    }
+}
+
+/// Parse the next single form from `input` with the default nesting-depth
+/// limit ([`DEFAULT_READER_DEPTH`]).
+///
+/// Returns `Ok(None)` when only whitespace/comments remain, or
+/// `Ok(Some((form, rest)))` with the remaining input on success.
+/// On failure returns `(byte_offset, detail)` where the offset is relative to
+/// `input` — render it with [`format_parse_error`] (or map it into a larger
+/// source buffer first, as [`crate::load_file`] does).
+#[allow(clippy::type_complexity)]
+pub fn read_next<'a>(
+    input: &'a str,
+    env: &Shared<Environment>,
+) -> Result<Option<(LispVal, &'a str)>, (usize, String)> {
+    read_next_with_depth_limit(input, env, DEFAULT_READER_DEPTH)
+}
+
+/// Like [`read_next`], but with a caller-chosen nesting-depth limit.
+///
+/// Pick `depth_limit` from the stack the parse runs on, at roughly 6.4 KB of
+/// stack per nesting level (measured; debug build — see
+/// [`DEFAULT_READER_DEPTH`]) with at least 2x margin. Nesting beyond the limit
+/// yields a normal positioned parse error (`nesting too deep (limit N)`).
+#[allow(clippy::type_complexity)]
+pub fn read_next_with_depth_limit<'a>(
+    input: &'a str,
+    env: &Shared<Environment>,
+    depth_limit: usize,
+) -> Result<Option<(LispVal, &'a str)>, (usize, String)> {
+    let to_result = |e: nom::Err<nom::error::Error<&'a str>>| -> (usize, String) {
+        match e {
+            nom::Err::Error(e) | nom::Err::Failure(e) => {
+                let detail = if e.code == TOO_DEEP_KIND {
+                    format!("nesting too deep (limit {depth_limit})")
+                } else if e.code == BAD_NUMBER_KIND {
+                    format!(
+                        "number literal out of range or with an invalid digit near '{}'",
+                        e.input.split(is_delimiter).next().unwrap_or("")
+                    )
+                } else {
+                    error_detail(e.input)
+                };
+                (input.len() - e.input.len(), detail)
+            }
+            nom::Err::Incomplete(_) => (input.len(), "incomplete input".to_string()),
+        }
+    };
+    // A source text can consist entirely of whitespace/comments and
+    // conditionals that resolve to "skip" (an entirely `#+`/`#-`'d-out
+    // file, or one whose only forms are behind an absent feature) -- that
+    // is "no more forms", not a parse error, so this pre-skip must itself
+    // be conditional-aware (issue #459).
+    let rest = match skip_ws_and_conditionals(env.clone(), depth_limit)(input) {
+        Ok((rest, ())) => rest,
+        Err(e) => return Err(to_result(e)),
+    };
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    match parse_expr(env.clone(), depth_limit)(rest) {
+        Ok((rem, val)) => Ok(Some((val, rem))),
+        Err(e) => Err(to_result(e)),
+    }
+}
+
+/// Return `true` when `input` looks like a *prefix* of a valid program —
+/// an unclosed `(`, an unterminated string, or an open block comment — as
+/// opposed to text that is malformed outright.  The REPL uses this to decide
+/// between prompting for a continuation line and reporting an error
+/// (issue #240).
+pub fn is_incomplete(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    let mut depth: i64 = 0;
+    let mut block_depth = 0usize;
+    // Byte-wise scan is UTF-8 safe: every byte matched below is ASCII, and
+    // UTF-8 continuation bytes can never equal an ASCII byte.
+    while i < n {
+        if block_depth > 0 {
+            if bytes[i] == b'#' && i + 1 < n && bytes[i + 1] == b'|' {
+                block_depth += 1;
+                i += 2;
+            } else if bytes[i] == b'|' && i + 1 < n && bytes[i + 1] == b'#' {
+                block_depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match bytes[i] {
+            b';' => {
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'#' if i + 1 < n && bytes[i + 1] == b'|' => {
+                block_depth = 1;
+                i += 2;
+            }
+            b'#' if i + 1 < n && bytes[i + 1] == b'\\' => {
+                // Skip a `#\c` char literal so `#\(` or `#\"` does not skew
+                // the depth count or open a string.
+                i += 2 + input[i + 2..].chars().next().map_or(0, char::len_utf8);
+            }
+            b'"' => {
+                i += 1;
+                let mut closed = false;
+                while i < n {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            closed = true;
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                if !closed {
+                    return true;
+                }
+            }
+            b'\'' => {
+                // Skip a char literal ('c' or '\c') so a quoted paren such as
+                // '(' does not skew the depth count.
+                let rest = &input[i + 1..];
+                let mut chars = rest.chars();
+                let consumed = match chars.next() {
+                    Some('\\') => match (chars.next(), chars.next()) {
+                        (Some(c2), Some('\'')) => 1 + c2.len_utf8() + 1,
+                        _ => 0,
+                    },
+                    Some(c1) if c1 != '\'' => match chars.next() {
+                        Some('\'') => c1.len_utf8() + 1,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                i += 1 + consumed;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    depth > 0 || block_depth > 0
+}
+
+/// Parse a single s-expression from `input` with the default nesting-depth
+/// limit ([`DEFAULT_READER_DEPTH`]) — safe on any stack of ~4 MiB or more.
+/// Callers on smaller stacks should use [`read_with_depth_limit`] with a
+/// lower limit; callers on the 512 MiB [`crate::with_large_stack`] thread may
+/// use a much higher one.
+///
+/// Symbols are interned into `env`'s symbol table and uppercased.
+/// Returns an error if the input contains trailing non-whitespace text after
+/// the first expression — use [`read_all`] to parse multiple forms.
+pub fn read(input: &str, env: &Shared<Environment>) -> Result<LispVal, String> {
+    read_with_depth_limit(input, env, DEFAULT_READER_DEPTH)
+}
+
+/// Like [`read`], but with a caller-chosen nesting-depth limit (see
+/// [`read_next_with_depth_limit`] for how to size it).
+pub fn read_with_depth_limit(
+    input: &str,
+    env: &Shared<Environment>,
+    depth_limit: usize,
+) -> Result<LispVal, String> {
+    let src = strip_shebang(input);
+    match read_next_with_depth_limit(src, env, depth_limit) {
+        Ok(None) => Err("empty input".to_string()),
+        Ok(Some((val, rest))) => {
+            let rest = skip_ws(rest);
+            if rest.is_empty() {
+                Ok(val)
+            } else {
+                Err(format_parse_error(
+                    src,
+                    src.len() - rest.len(),
+                    &format!("unexpected trailing input: {}", rest.trim_end()),
+                ))
+            }
+        }
+        Err((offset, detail)) => Err(format_parse_error(src, offset, &detail)),
+    }
+}
+
+/// Parse zero or more s-expressions from `input` and return them in order,
+/// with the default nesting-depth limit ([`DEFAULT_READER_DEPTH`]).
+///
+/// This is the function used for loading files and multi-expression strings.
+/// Stops at EOF; returns an error on the first malformed expression.
+pub fn read_all(input: &str, env: &Shared<Environment>) -> Result<Vec<LispVal>, String> {
+    read_all_with_depth_limit(input, env, DEFAULT_READER_DEPTH)
+}
+
+/// Like [`read_all`], but with a caller-chosen nesting-depth limit (see
+/// [`read_next_with_depth_limit`] for how to size it).
+pub fn read_all_with_depth_limit(
+    input: &str,
+    env: &Shared<Environment>,
+    depth_limit: usize,
+) -> Result<Vec<LispVal>, String> {
+    let src = strip_shebang(input);
+    let mut results = vec![];
+    let mut current = src;
+    loop {
+        current = skip_ws(current);
+        let form_offset = src.len() - current.len();
+        match read_next_with_depth_limit(current, env, depth_limit) {
+            Ok(None) => return Ok(results),
+            Ok(Some((val, rest))) => {
+                results.push(val);
+                current = rest;
+            }
+            Err((offset, detail)) => {
+                let absolute = error_anchor(src, form_offset, offset, &detail);
+                return Err(format_parse_error(src, absolute, &detail));
+            }
+        }
+    }
+}
+
+/// Pick the byte offset to report for a parse error: normally where parsing
+/// stopped, but for errors at end of input (an unclosed form) the *start* of
+/// the offending form — "line 3: unclosed '('" beats "line 47: end of file".
+pub fn error_anchor(src: &str, form_offset: usize, error_offset: usize, detail: &str) -> usize {
+    let absolute = form_offset + error_offset;
+    if detail.contains("end of input") || absolute >= src.trim_end().len() {
+        form_offset
+    } else {
+        absolute
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cons(car: LispVal, cdr: LispVal) -> LispVal {
+        LispVal::Cons {
+            car: Shared::new(car),
+            cdr: Shared::new(cdr),
+        }
+    }
+
+    fn symbol(s: &str, env: &Shared<Environment>) -> LispVal {
+        LispVal::Symbol(env.intern_symbol(s))
+    }
+
+    fn number(n: i64) -> LispVal {
+        LispVal::Number(n)
+    }
+
+    fn float(f: f64) -> LispVal {
+        LispVal::Float(f)
+    }
+
+    #[test]
+    fn test_empty_semicolon_comment_is_skipped() {
+        let env = Environment::new_with_builtins();
+        let all = read_all("(print 1)\n;\n(print 2)", &env).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(read_all("(print 1) ;", &env).unwrap().len(), 1);
+        assert_eq!(
+            read_all("(print 1)\r\n;\r\n(print 2)", &env).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_parse_number() {
+        assert_eq!(parse_number("123"), Ok(("", number(123))));
+        assert_eq!(parse_number("-456"), Ok(("", number(-456))));
+    }
+
+    #[test]
+    fn test_parse_octal() {
+        // 177Q = 1*64 + 7*8 + 7 = 127 decimal
+        assert_eq!(parse_number("177Q"), Ok(("", number(127))));
+        // 10Q = 8 decimal
+        assert_eq!(parse_number("10Q"), Ok(("", number(8))));
+        // 0Q = 0
+        assert_eq!(parse_number("0Q"), Ok(("", number(0))));
+        // negative octal
+        assert_eq!(parse_number("-10Q"), Ok(("", number(-8))));
+        // non-octal digits still parse as decimal (no trailing Q)
+        assert_eq!(parse_number("177"), Ok(("", number(177))));
+    }
+
+    #[test]
+    fn test_parse_float() {
+        assert_eq!(parse_float("3.25"), Ok(("", float(3.25))));
+        assert_eq!(parse_float("-0.5"), Ok(("", float(-0.5))));
+    }
+
+    #[test]
+    fn test_parse_hex() {
+        // Assembly-style H suffix; case-insensitive digits and marker.
+        // REGULARITY (0.3): must start with a decimal digit, so short
+        // letters-then-h names (ch, each, ffh) are ordinary symbols.
+        assert!(parse_number("ffh").is_err());
+        assert!(parse_number("FFH").is_err());
+        assert!(parse_number("deadh").is_err());
+        assert!(parse_number("-ffh").is_err());
+        assert_eq!(parse_number("0ffh"), Ok(("", number(255))));
+        assert_eq!(parse_number("0FFH"), Ok(("", number(255))));
+        assert_eq!(parse_number("1Ah"), Ok(("", number(26))));
+        assert_eq!(parse_number("10h"), Ok(("", number(16))));
+        assert_eq!(parse_number("0ah"), Ok(("", number(10))));
+        assert_eq!(parse_number("-0ffh"), Ok(("", number(-255))));
+        assert_eq!(parse_number("0deadh"), Ok(("", number(0xDEAD))));
+        // Boundary: a following identifier char means it was a symbol, so the
+        // hex parser must reject and leave the input for the symbol parser.
+        assert!(parse_hex_integer("ffhello").is_err());
+        // No H suffix: not hex (handled by the symbol parser, not parse_number).
+        assert!(parse_hex_integer("ff").is_err());
+    }
+
+    #[test]
+    fn test_parse_char_literal() {
+        // 'c' is a Char value carrying the byte code point.
+        assert_eq!(parse_char_literal("'A'"), Ok(("", LispVal::Char(65))));
+        assert_eq!(parse_char_literal("'0'"), Ok(("", LispVal::Char(48))));
+        assert_eq!(parse_char_literal("' '"), Ok(("", LispVal::Char(32))));
+        // escapes
+        assert_eq!(parse_char_literal("'\\n'"), Ok(("", LispVal::Char(10))));
+        assert_eq!(parse_char_literal("'\\''"), Ok(("", LispVal::Char(39))));
+        assert_eq!(parse_char_literal("'\\\\'"), Ok(("", LispVal::Char(92))));
+        // trailing input is left for the next parser
+        assert_eq!(parse_char_literal("'a'b"), Ok(("b", LispVal::Char(97))));
+    }
+
+    #[test]
+    fn test_parse_hash_char_literal() {
+        // Issue #526: #\c is the same Char value as 'c'.
+        let ok = |src: &str, rest: &str, code: u8| {
+            assert_eq!(
+                parse_hash_char_literal(src),
+                Ok((rest, LispVal::Char(code))),
+                "{src}"
+            );
+        };
+        ok("#\\a", "", b'a');
+        ok("#\\A", "", b'A');
+        ok("#\\0", "", b'0');
+        // Any single non-alphanumeric character, including delimiters.
+        ok("#\\(", "", b'(');
+        ok("#\\)", "", b')');
+        ok("#\\\"", "", b'"');
+        ok("#\\;", "", b';');
+        ok("#\\ ", "", b' ');
+        ok("#\\\\", "", b'\\');
+        // Names, case-insensitive.
+        ok("#\\Space", "", b' ');
+        ok("#\\NEWLINE", "", b'\n');
+        ok("#\\tab", "", b'\t');
+        ok("#\\Nul", "", 0);
+        // A delimiter ends the token.
+        ok("#\\a)", ")", b'a');
+        ok("#\\Space)", ")", b' ');
+        ok("#\\x y", " y", b'x');
+        // An unknown multi-character name is an error, as is a code point
+        // that does not fit the byte-wide char.
+        assert!(parse_hash_char_literal("#\\ab").is_err());
+        assert!(parse_hash_char_literal("#\\Spaces").is_err());
+        assert!(parse_hash_char_literal("#\\").is_err());
+        assert!(parse_hash_char_literal("#\\\u{3bb}").is_err());
+    }
+
+    #[test]
+    fn test_hash_char_literal_in_forms() {
+        let env = Shared::new(Environment::new());
+        assert_eq!(
+            read("(#\\a #\\( #\\) #\\\" #\\Space 'b')", &env).unwrap(),
+            read("('a' '(' ')' '\"' ' ' 'b')", &env).unwrap()
+        );
+        // #\ is not the #' / #x / #| dispatch.
+        assert_eq!(read("#x1F", &env).unwrap(), LispVal::Number(31));
+        // The REPL continuation check must not count a #\( or #\" as open.
+        assert!(!is_incomplete("(list #\\( #\\\")"));
+        assert!(!is_incomplete("#\\("));
+        assert!(is_incomplete("(list #\\)"));
+        // A named char is complete input; only its first character is
+        // skipped, the rest of the name is inert letters.
+        assert!(!is_incomplete("(list #\\Space)"));
+        assert!(!is_incomplete("#\\Space"));
+        // `#\|` is a char, not the start of a `#|` block comment.
+        assert!(!is_incomplete("(list #\\| 1)"));
+        // `#\Space(` is the char followed by an unclosed list: genuinely
+        // incomplete, exactly as the reader sees it.
+        assert!(is_incomplete("#\\Space("));
+    }
+
+    #[test]
+    fn test_char_literal_vs_quote() {
+        // 'a (no closing quote) is NOT a char literal; the quote macro handles it.
+        assert!(parse_char_literal("'a").is_err());
+        assert!(parse_char_literal("'(1 2)").is_err());
+        // The empty '' is not a char literal.
+        assert!(parse_char_literal("''").is_err());
+        // Full reader: 'a' is a Char, 'a is (quote a).
+        let env = Shared::new(Environment::new());
+        assert_eq!(read("'A'", &env), Ok(LispVal::Char(65)));
+        assert_eq!(
+            read("'a", &env),
+            Ok(cons(
+                symbol("QUOTE", &env),
+                cons(symbol("A", &env), LispVal::Nil)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_atom() {
+        let env = Shared::new(Environment::new());
+        assert_eq!(
+            parse_atom(env.clone())("abc"),
+            Ok(("", symbol("ABC", &env)))
+        );
+        assert_eq!(
+            parse_atom(env.clone())("with-hyphen"),
+            Ok(("", symbol("WITH-HYPHEN", &env)))
+        );
+        assert_eq!(
+            parse_atom(env.clone())(":op"),
+            Ok(("", symbol(":OP", &env)))
+        );
+        assert_eq!(
+            parse_atom(env.clone())(":with-hyphen"),
+            Ok(("", symbol(":WITH-HYPHEN", &env)))
+        );
+    }
+
+    #[test]
+    fn test_parse_multichar_symbols() {
+        let env = Shared::new(Environment::new());
+        // alpha + operator suffix
+        assert_eq!(parse_atom(env.clone())("v+"), Ok(("", symbol("V+", &env))));
+        assert_eq!(parse_atom(env.clone())("v-"), Ok(("", symbol("V-", &env))));
+        // multi-char operator sequences
+        assert_eq!(parse_atom(env.clone())(">="), Ok(("", symbol(">=", &env))));
+        assert_eq!(parse_atom(env.clone())("<="), Ok(("", symbol("<=", &env))));
+        assert_eq!(parse_atom(env.clone())("!="), Ok(("", symbol("!=", &env))));
+        assert_eq!(parse_atom(env.clone())("/="), Ok(("", symbol("/=", &env))));
+        // single operators still work
+        assert_eq!(parse_atom(env.clone())("+"), Ok(("", symbol("+", &env))));
+        assert_eq!(parse_atom(env.clone())("-"), Ok(("", symbol("-", &env))));
+    }
+
+    #[test]
+    fn test_parse_string() {
+        assert_eq!(
+            parse_string("\"hello world\""),
+            Ok(("", LispVal::String("hello world".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_parse_list() {
+        let env = Shared::new(Environment::new());
+        assert_eq!(
+            parse_list(env.clone(), DEFAULT_READER_DEPTH)("(PLUS 1 2)"),
+            Ok((
+                "",
+                cons(
+                    symbol("PLUS", &env),
+                    cons(number(1), cons(number(2), LispVal::Nil))
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_simple_list() {
+        let env = Shared::new(Environment::new());
+        let result = read("(PLUS 10 20)", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("PLUS", &env),
+                cons(number(10), cons(number(20), LispVal::Nil))
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_nested_list() {
+        let env = Shared::new(Environment::new());
+        let result = read("(PLUS 10 (TIMES 5 2))", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("PLUS", &env),
+                cons(
+                    number(10),
+                    cons(
+                        cons(
+                            symbol("TIMES", &env),
+                            cons(number(5), cons(number(2), LispVal::Nil))
+                        ),
+                        LispVal::Nil
+                    )
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_dotted_list() {
+        let env = Shared::new(Environment::new());
+        let result = read("(a . b)", &env);
+        assert_eq!(result, Ok(cons(symbol("A", &env), symbol("B", &env))));
+    }
+
+    #[test]
+    fn test_read_rejects_dot_without_leading_element() {
+        let env = Shared::new(Environment::new());
+        assert!(read("(. 1)", &env).is_err());
+    }
+
+    #[test]
+    fn test_read_complex_dotted_list() {
+        let env = Shared::new(Environment::new());
+        let result = read("(a b . c)", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("A", &env),
+                cons(symbol("B", &env), symbol("C", &env))
+            ))
+        );
+    }
+
+    #[test]
+    fn test_comment() {
+        let env = Shared::new(Environment::new());
+        let result = read(
+            "
+            ; this is a comment
+            (PLUS 1 2) ; another comment
+        ",
+            &env,
+        );
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("PLUS", &env),
+                cons(number(1), cons(number(2), LispVal::Nil))
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_quoted() {
+        let env = Shared::new(Environment::new());
+        let result = read("'a", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("QUOTE", &env),
+                cons(symbol("A", &env), LispVal::Nil)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_quasiquote() {
+        let env = Shared::new(Environment::new());
+        let result = read("`(a ,b)", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("QUASIQUOTE", &env),
+                cons(
+                    cons(
+                        symbol("A", &env),
+                        cons(
+                            cons(
+                                symbol("UNQUOTE", &env),
+                                cons(symbol("B", &env), LispVal::Nil)
+                            ),
+                            LispVal::Nil
+                        )
+                    ),
+                    LispVal::Nil
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_unquote_splicing() {
+        let env = Shared::new(Environment::new());
+        // ,@xs reads as (UNQUOTE-SPLICING xs)
+        let result = read(",@xs", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("UNQUOTE-SPLICING", &env),
+                cons(symbol("XS", &env), LispVal::Nil)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_unquote_vs_splicing() {
+        let env = Shared::new(Environment::new());
+        // ,x (no @) stays plain UNQUOTE, not splicing
+        let result = read(",x", &env);
+        assert_eq!(
+            result,
+            Ok(cons(
+                symbol("UNQUOTE", &env),
+                cons(symbol("X", &env), LispVal::Nil)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_read_nil() {
+        let env = Shared::new(Environment::new());
+        assert_eq!(read("NIL", &env), Ok(LispVal::Nil));
+    }
+
+    #[test]
+    fn test_read_t() {
+        let env = Shared::new(Environment::new());
+        assert_eq!(read("T", &env), Ok(symbol("T", &env)));
+    }
+}
